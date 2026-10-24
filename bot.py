@@ -9,7 +9,7 @@ import os
 import random
 from pathlib import Path
 from typing import Any, Optional
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, unquote
 import ipaddress
 
 import aiohttp
@@ -111,7 +111,7 @@ def guardar_imagem_fila(guild_id: int, dados: bytes) -> str:
     extensao = {"PNG": "png", "JPG": "jpg", "GIF": "gif", "WEBP": "webp"}[formato]
     resumo = hashlib.sha256(dados).hexdigest()[:20]
     # Nome pelo conteúdo: impede o Discord de reutilizar a imagem antiga em cache.
-    nome = f"painel_lol_{guild_id}_{resumo}.{extensao}"
+    nome = f"painel-lol-{guild_id}-{resumo}.{extensao}"
     PASTA_IMAGENS_FILA.mkdir(parents=True, exist_ok=True)
     caminho = PASTA_IMAGENS_FILA / nome
     temporario = PASTA_IMAGENS_FILA / f"{guild_id}.{resumo}.tmp"
@@ -148,11 +148,13 @@ def imagem_fila_salva(guild_id: int) -> tuple[bytes, str] | None:
     if nome_registrado and Path(nome_registrado).name == nome_registrado:
         candidatos.append(PASTA_IMAGENS_FILA / nome_registrado)
     if PASTA_IMAGENS_FILA.is_dir():
-        # Aceita também o formato antigo (painel_lol_ID.gif), sem migrar o upload.
-        for caminho in PASTA_IMAGENS_FILA.glob(f"painel_lol_{guild_id}.*"):
-            candidatos.append(caminho)
-        outros = list(PASTA_IMAGENS_FILA.glob(f"painel_lol_{guild_id}_*.*"))
-        candidatos.extend(sorted(outros, key=lambda p: p.stat().st_mtime, reverse=True))
+        # Compatível com as duas versões anteriores (nomes com underline).
+        for padrao in (
+            f"painel-lol-{guild_id}-*.*", f"painel_lol_{guild_id}_*.*",
+            f"painel_lol_{guild_id}.*",
+        ):
+            outros = list(PASTA_IMAGENS_FILA.glob(padrao))
+            candidatos.extend(sorted(outros, key=lambda p: p.stat().st_mtime, reverse=True))
 
     for caminho in dict.fromkeys(candidatos):
         try:
@@ -167,6 +169,17 @@ def imagem_fila_salva(guild_id: int) -> tuple[bytes, str] | None:
         if caminho.name == nome_registrado and registro.get("sha256") and registro["sha256"] != digest:
             log.warning("Imagem padrão corrompida: %s", caminho)
             continue
+        # Atualiza imagens antigas cujo nome continha underline, pois nomes de
+        # anexos sem underscore são mais confiáveis em embeds do Discord.
+        if "_" in caminho.name:
+            extensao = caminho.suffix.lower().lstrip(".")
+            seguro = f"painel-lol-{guild_id}-{digest[:20]}.{extensao}"
+            destino = PASTA_IMAGENS_FILA / seguro
+            if not destino.exists():
+                temporario = PASTA_IMAGENS_FILA / f"{seguro}.tmp"
+                temporario.write_bytes(dados)
+                temporario.replace(destino)
+            caminho = destino
         if nome_registrado != caminho.name:
             imagens_fila[str(guild_id)] = {"nome": caminho.name, "sha256": digest}
             salvar_config_imagens()
@@ -181,21 +194,38 @@ def imagem_fila_salva(guild_id: int) -> tuple[bytes, str] | None:
     return None
 
 
-def anexos_para_fila(guild_id: int, fila: dict[str, Any], anexos: list) -> list:
-    """Impede que um edit do Discord remova a imagem do embed da fila."""
+def opcoes_imagem_edicao_fila(
+    guild_id: int, fila: dict[str, Any], mensagem: discord.Message
+) -> dict[str, Any]:
+    """Preserva imagens de embed mesmo que Discord oculte seus anexos.
+
+    Arquivos utilizados no embed frequentemente NÃO aparecem em
+    mensagem.attachments. Nesse caso, não passar attachments ao editar
+    conserva o anexo que já está na mensagem. Só reenvia se a imagem
+    realmente não estiver referenciada nos embeds existentes.
+    """
     nome = fila.get("imagem_nome")
-    if not nome or any(a.filename == nome for a in anexos):
-        return anexos
-    imagem = imagem_fila_salva(guild_id)
-    if imagem is None:
+    if not nome:
+        return {}
+    if any(anexo.filename == nome for anexo in mensagem.attachments):
+        return {}
+    for embed in mensagem.embeds:
+        imagem = getattr(embed, "image", None)
+        url = getattr(imagem, "url", None)
+        if url and (url == f"attachment://{nome}" or unquote(urlsplit(url).path).endswith("/" + nome)):
+            return {}
+    # Imagem não identificada nem no embed nem na lista de anexos.
+    imagem_salva = imagem_fila_salva(guild_id)
+    if imagem_salva is None:
         raise FileNotFoundError("Imagem do painel indisponível. Use /queue_imagem.")
-    dados, nome = imagem
-    fila["imagem_nome"] = nome
+    dados, nome_salvo = imagem_salva
+    fila["imagem_nome"] = nome_salvo
     salvar_filas()
-    # Reanexa do disco se o Discord perdeu a imagem após edição ou reinício.
-    outros = [a for a in anexos if not a.filename.startswith("painel_lol_")]
-    log.warning("Recuperando anexo perdido na mensagem da fila: servidor %s", guild_id)
-    return [*outros, discord.File(io.BytesIO(dados), filename=nome)]
+    log.warning("Reanexando imagem ausente à queue do servidor %s", guild_id)
+    return {"attachments": [
+        *mensagem.attachments,
+        discord.File(io.BytesIO(dados), filename=nome_salvo),
+    ]}
 
 
 # Se reiniciou enquanto uma fila estava iniciando, a partida já está salva.
@@ -799,13 +829,13 @@ async def atualizar_mensagem_fila(
                 if cancelada else "A partida começou. Confira abaixo a mensagem com os times sorteados."
             )
             embed.color = 0xF59E0B
-            await mensagem.edit(embed=embed, view=None, attachments=mensagem.attachments)
+            await mensagem.edit(embed=embed, view=None)
         else:
             await mensagem.edit(
                 embed=montar_embed_fila(fila), view=FilaView(
                     cheia=fila_cheia(fila), pagina=fila_pagina(fila), paginas=fila_total_paginas(fila)
                 ),
-                attachments=anexos_para_fila(guild.id, fila, mensagem.attachments),
+                **opcoes_imagem_edicao_fila(guild.id, fila, mensagem),
             )
     except (discord.Forbidden, discord.NotFound, discord.HTTPException) as exc:
         log.warning("Não foi possível atualizar a mensagem da fila: %s", exc)
@@ -874,7 +904,7 @@ class FilaView(discord.ui.View):
                 embed=montar_embed_fila(fila), view=FilaView(
                     cheia=fila_cheia(fila), pagina=fila_pagina(fila), paginas=fila_total_paginas(fila)
                 ),
-                attachments=anexos_para_fila(inter.guild.id, fila, inter.message.attachments),
+                **opcoes_imagem_edicao_fila(inter.guild.id, fila, inter.message),
                 allowed_mentions=discord.AllowedMentions.none(),
             )
 
@@ -898,7 +928,7 @@ class FilaView(discord.ui.View):
             salvar_filas()
             await inter.response.edit_message(
                 embed=montar_embed_fila(fila), view=FilaView(cheia=False, pagina=fila_pagina(fila), paginas=fila_total_paginas(fila)),
-                attachments=anexos_para_fila(inter.guild.id, fila, inter.message.attachments),
+                **opcoes_imagem_edicao_fila(inter.guild.id, fila, inter.message),
                 allowed_mentions=discord.AllowedMentions.none(),
             )
 
@@ -935,7 +965,7 @@ class FilaView(discord.ui.View):
                     cheia=fila_cheia(fila), pagina=fila_pagina(fila),
                     paginas=fila_total_paginas(fila),
                 ),
-                attachments=anexos_para_fila(inter.guild.id, fila, inter.message.attachments),
+                **opcoes_imagem_edicao_fila(inter.guild.id, fila, inter.message),
                 allowed_mentions=discord.AllowedMentions.none(),
             )
 
@@ -1388,19 +1418,9 @@ async def queue(
         if imagem_dados is not None:
             envio["file"] = discord.File(io.BytesIO(imagem_dados), filename=imagem_nome)
         mensagem = await inter.followup.send(**envio)
-        if imagem_dados is not None and not any(
-            a.filename == imagem_nome for a in mensagem.attachments
-        ):
-            log.error("Discord não anexou a imagem à mensagem da fila: %s", imagem_nome)
-            try:
-                await mensagem.delete()
-            except discord.HTTPException:
-                pass
-            await inter.followup.send(
-                "⚠️ A imagem foi salva, mas o Discord não a anexou ao painel. "
-                "Confira o tamanho/formato e tente /queue novamente.", ephemeral=True
-            )
-            return
+        # Em mensagens com attachment://, o Discord não lista a imagem em
+        # mensagem.attachments. O envio já foi aceito sem lançar exceção;
+        # nunca excluir o painel por essa lista estar vazia.
         fila["message_id"] = mensagem.id
         filas[str(guild.id)] = fila
         salvar_filas()
