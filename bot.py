@@ -31,6 +31,7 @@ ARQUIVO_PARTIDAS = Path("/data/partidas.json")
 ARQUIVO_FILAS = Path("/data/filas.json")
 ARQUIVO_IMAGENS_FILA = Path("/data/queue_imagens.json")
 ARQUIVO_CORES_FILA = Path("/data/queue_cores.json")
+ARQUIVO_PRESENCA = Path("/data/bot_presenca.json")
 PASTA_IMAGENS_FILA = Path("/data/queue_imagens")
 TAMANHO_TIME = 5
 # De 2 a 6 equipes de cinco participantes; o painel visual tem SEMPRE duas colunas.
@@ -358,6 +359,59 @@ def autorizado(interaction: discord.Interaction) -> bool:
     )
 
 
+# ====================== PRESENÇA DO BOT ======================
+# Estado e texto salvos em /data para continuar após reinício ou redeploy.
+ESTADOS_BOT = {
+    "disponivel": discord.Status.online,
+    "ausente": discord.Status.idle,
+    "ocupado": discord.Status.dnd,
+    "invisivel": discord.Status.invisible,
+}
+ROTULOS_ESTADOS_BOT = {
+    "disponivel": "🟢 Disponível",
+    "ausente": "🌙 Ausente",
+    "ocupado": "🔴 Ocupado",
+    "invisivel": "⚫ Invisível",
+}
+
+
+def carregar_presenca() -> dict[str, str]:
+    """Lê configuração global da presença e valida antes do login."""
+    padrao = {"estado": "disponivel", "texto": ""}
+    if not ARQUIVO_PRESENCA.exists():
+        return padrao
+    try:
+        dados = json.loads(ARQUIVO_PRESENCA.read_text(encoding="utf-8"))
+        if not isinstance(dados, dict):
+            raise ValueError("A configuração precisa ser um objeto JSON.")
+        estado = dados.get("estado", "disponivel")
+        texto = dados.get("texto", "")
+        if estado not in ESTADOS_BOT or not isinstance(texto, str) or len(texto) > 128:
+            raise ValueError("Estado ou texto de presença inválido.")
+        return {"estado": estado, "texto": texto}
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"Erro ao ler bot_presenca.json: {exc}") from exc
+
+
+def salvar_presenca(config: dict[str, str]) -> None:
+    """Gravação atômica no disco persistente do FadeHost."""
+    ARQUIVO_PRESENCA.parent.mkdir(parents=True, exist_ok=True)
+    temporario = ARQUIVO_PRESENCA.with_suffix(".json.tmp")
+    temporario.write_text(
+        json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    temporario.replace(ARQUIVO_PRESENCA)
+
+
+def atividade_presenca(texto: str) -> discord.CustomActivity | None:
+    """Usa texto livre em vez de prefixos Jogando/Assistindo."""
+    return discord.CustomActivity(name=texto) if texto else None
+
+
+presenca_bot = carregar_presenca()
+trava_presenca_bot = asyncio.Lock()
+
+
 intents = discord.Intents.default()
 intents.members = True
 intents.voice_states = True
@@ -365,7 +419,11 @@ intents.voice_states = True
 
 class ClientePartidas(discord.Client):
     def __init__(self) -> None:
-        super().__init__(intents=intents)
+        super().__init__(
+            intents=intents,
+            status=ESTADOS_BOT[presenca_bot["estado"]],
+            activity=atividade_presenca(presenca_bot["texto"]),
+        )
         self.tree = app_commands.CommandTree(self)
 
     async def setup_hook(self) -> None:
@@ -2131,6 +2189,111 @@ def registrar_comandos_perfil(bot: discord.Client) -> None:
 
 
 registrar_comandos_perfil(bot)
+
+
+# Comando único para mudar presença e texto do bot.
+# Apenas o proprietário da aplicação pode mudar um status global.
+@bot.tree.command(
+    name="bot_status",
+    description="Personaliza o texto e a presença do bot (Disponível, Ausente, Ocupado ou Invisível)",
+)
+@app_commands.describe(
+    estado="Como o bot deve aparecer para os membros",
+    texto="Texto personalizado do perfil (opcional; 'limpar' remove o texto)",
+)
+@app_commands.choices(
+    estado=[
+        app_commands.Choice(name="🟢 Disponível", value="disponivel"),
+        app_commands.Choice(name="🌙 Ausente", value="ausente"),
+        app_commands.Choice(name="🔴 Ocupado", value="ocupado"),
+        app_commands.Choice(name="⚫ Invisível", value="invisivel"),
+    ],
+)
+async def bot_status(
+    inter: discord.Interaction,
+    estado: app_commands.Choice[str],
+    texto: str | None = None,
+) -> None:
+    try:
+        permitido = await eh_dono(bot, inter.user)
+    except discord.HTTPException:
+        await inter.response.send_message(
+            "⚠️ Não consegui verificar o proprietário do bot. Tente novamente.",
+            ephemeral=True,
+        )
+        return
+    if not permitido:
+        await inter.response.send_message(
+            "🔒 Apenas o proprietário do bot pode alterar sua presença.",
+            ephemeral=True,
+        )
+        return
+
+    if texto is not None and len(texto) > 128:
+        await inter.response.send_message(
+            "⚠️ O texto deve ter no máximo 128 caracteres.", ephemeral=True
+        )
+        return
+
+    await inter.response.defer(ephemeral=True, thinking=True)
+    async with trava_presenca_bot:
+        anterior = dict(presenca_bot)
+        novo = {
+            "estado": estado.value,
+            "texto": (
+                anterior["texto"] if texto is None else
+                "" if texto.strip().casefold() == "limpar" else texto.strip()
+            ),
+        }
+        try:
+            # Altera já, sem reiniciar o bot.
+            await bot.change_presence(
+                status=ESTADOS_BOT[novo["estado"]],
+                activity=atividade_presenca(novo["texto"]),
+            )
+        except (discord.DiscordException, TypeError, OSError) as exc:
+            log.warning("Falha ao mudar presença do bot: %s", exc)
+            await inter.followup.send(
+                "⚠️ Não consegui alterar a presença agora. Confira o console do FadeHost.",
+                ephemeral=True,
+            )
+            return
+
+        try:
+            salvar_presenca(novo)
+        except OSError as exc:
+            log.exception("Não foi possível persistir a presença do bot: %s", exc)
+            try:
+                await bot.change_presence(
+                    status=ESTADOS_BOT[anterior["estado"]],
+                    activity=atividade_presenca(anterior["texto"]),
+                )
+            except discord.DiscordException:
+                log.exception("Não foi possível restaurar a presença anterior")
+            await inter.followup.send(
+                "⚠️ A presença não foi salva em /data. Veja as permissões da hospedagem.",
+                ephemeral=True,
+            )
+            return
+
+        presenca_bot.update(novo)
+
+    resposta = (
+        f"✅ **Presença atualizada!**\n"
+        f"**Estado:** {ROTULOS_ESTADOS_BOT[novo['estado']]}\n"
+        f"**Texto:** {discord.utils.escape_markdown(novo['texto']) if novo['texto'] else 'Sem texto'}\n"
+        "💾 Configuração salva e restaurada automaticamente após reiniciar o bot."
+    )
+    if novo["estado"] == "invisivel":
+        resposta += (
+            "\n👁️ O modo Invisível faz o bot parecer offline, "
+            "mas seus comandos continuam funcionando."
+        )
+    await inter.followup.send(
+        resposta,
+        ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
 
 
 if __name__ == "__main__":
