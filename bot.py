@@ -267,7 +267,7 @@ async def partida_iniciar(
             ephemeral=True,
         )
         return
-    if not eu.permissions_in(canal).move_members:
+    if not canal.permissions_for(eu).move_members:
         await interaction.response.send_message(
             "⚠️ O bot não pode mover pessoas no canal de origem selecionado.",
             ephemeral=True,
