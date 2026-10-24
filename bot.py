@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import random
+import re
 from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urlsplit, unquote
@@ -29,6 +30,7 @@ GUILD_ID = os.getenv("DISCORD_GUILD_ID", "").strip()
 ARQUIVO_PARTIDAS = Path("/data/partidas.json")
 ARQUIVO_FILAS = Path("/data/filas.json")
 ARQUIVO_IMAGENS_FILA = Path("/data/queue_imagens.json")
+ARQUIVO_CORES_FILA = Path("/data/queue_cores.json")
 PASTA_IMAGENS_FILA = Path("/data/queue_imagens")
 TAMANHO_TIME = 5
 # De 2 a 6 equipes de cinco participantes; o painel visual tem SEMPRE duas colunas.
@@ -92,6 +94,62 @@ def carregar_config_imagens() -> dict[str, dict[str, str]]:
 
 
 imagens_fila = carregar_config_imagens()
+
+# Cores do embed do painel, configuradas por servidor e persistidas no FadeHost.
+CORES_PREDEFINIDAS = (
+    ("🟣 Roxo", "#9B59B6"),
+    ("🔵 Azul", "#5865F2"),
+    ("🔴 Vermelho", "#ED4245"),
+    ("🟢 Verde", "#57F287"),
+    ("🟡 Amarelo", "#FEE75C"),
+    ("🟠 Laranja", "#F39C12"),
+    ("🌸 Rosa", "#EB459E"),
+    ("⚪ Branco", "#FFFFFF"),
+    ("⚫ Escuro", "#23272A"),
+)
+
+
+def normalizar_cor_hex(texto: str) -> str:
+    """Converte #RRGGBB ou RRGGBB em #RRGGBB, recusando formatos inválidos."""
+    valor = (texto or "").strip().upper()
+    if not re.fullmatch(r"#?[0-9A-F]{6}", valor):
+        raise ValueError("Use uma cor HEX de seis dígitos. Exemplo: #FF1493.")
+    return "#" + valor.lstrip("#")
+
+
+def carregar_cores_fila() -> dict[str, str]:
+    if not ARQUIVO_CORES_FILA.exists():
+        return {}
+    try:
+        dados = json.loads(ARQUIVO_CORES_FILA.read_text(encoding="utf-8"))
+        if not isinstance(dados, dict):
+            raise ValueError("A configuração de cores deve ser um objeto JSON.")
+        return {str(gid): normalizar_cor_hex(cor) for gid, cor in dados.items()}
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"Erro ao ler queue_cores.json: {exc}") from exc
+
+
+cores_fila = carregar_cores_fila()
+
+
+def salvar_cores_fila() -> None:
+    ARQUIVO_CORES_FILA.parent.mkdir(parents=True, exist_ok=True)
+    temporario = ARQUIVO_CORES_FILA.with_suffix(".json.tmp")
+    temporario.write_text(
+        json.dumps(cores_fila, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    temporario.replace(ARQUIVO_CORES_FILA)
+
+
+def cor_do_embed_fila(fila: dict[str, Any]) -> int:
+    """Retorna a cor customizada ou a cor original do painel da fila."""
+    personalizado = fila.get("cor_embed")
+    if personalizado:
+        try:
+            return int(normalizar_cor_hex(personalizado)[1:], 16)
+        except ValueError:
+            log.warning("Cor de fila inválida, usando cor padrão: %s", personalizado)
+    return 0x22C55E if fila_cheia(fila) else 0x5865F2
 
 
 def salvar_config_imagens() -> None:
@@ -776,7 +834,7 @@ def montar_embed_fila(fila: dict[str, Any]) -> discord.Embed:
                 if cheio else "Clique em **Entrar** para participar ou **Sair** para cancelar."
             )
         ),
-        color=0x22C55E if cheio else 0x5865F2,
+        color=cor_do_embed_fila(fila),
     )
     # Sempre exatamente duas colunas. Páginas extras não criam novas colunas.
     for coluna, (emoji, nome) in enumerate((("🔴", "Vermelho"), ("🔵", "Azul"))):
@@ -828,7 +886,7 @@ async def atualizar_mensagem_fila(
                 "A fila foi cancelada. Use `/queue` para abrir outra."
                 if cancelada else "A partida começou. Confira abaixo a mensagem com os times sorteados."
             )
-            embed.color = 0xF59E0B
+            embed.color = cor_do_embed_fila(fila) if fila.get("cor_embed") else 0xF59E0B
             await mensagem.edit(embed=embed, view=None)
         else:
             await mensagem.edit(
@@ -1120,7 +1178,7 @@ class FilaView(discord.ui.View):
                     f"podem conectar.\n🎙️ Canal original: {origem.mention}\n"
                     f"↪️ {movidos}/{len(jogadores)} jogadores movidos."
                 ),
-                color=0x5865F2,
+                color=(cor_do_embed_fila(fila) if fila.get("cor_embed") else 0x5865F2),
             )
             for chave, emoji, nome in EQUIPES[:fila["equipes"]]:
                 canal = buscar_voz(guild, partida["canais"][chave])
@@ -1408,6 +1466,7 @@ async def queue(
             "inscritos": [],
             "status": "aberta",
             "imagem_nome": imagem_nome,
+            "cor_embed": cores_fila.get(str(guild.id)),
         }
         envio = {
             "embed": montar_embed_fila(fila),
@@ -1424,6 +1483,182 @@ async def queue(
         fila["message_id"] = mensagem.id
         filas[str(guild.id)] = fila
         salvar_filas()
+
+
+# ======================= PERSONALIZAR COR DO EMBED =======================
+# Uma cor por servidor, compartilhada pelas filas futuras e atuais.
+# Somente o dono da aplicação ou do servidor pode alterar.
+
+
+async def aplicar_cor_queue(inter: discord.Interaction, cor: str | None) -> None:
+    """Persiste a cor escolhida e atualiza o embed da fila aberta, se houver."""
+    if inter.guild is None or not await dono_da_fila(inter):
+        await inter.response.send_message(
+            "🔒 Apenas o dono do servidor ou do bot pode mudar a cor do painel.",
+            ephemeral=True,
+        )
+        return
+    if cor is not None:
+        try:
+            cor = normalizar_cor_hex(cor)
+        except ValueError as exc:
+            await inter.response.send_message(f"⚠️ {exc}", ephemeral=True)
+            return
+
+    await inter.response.defer(ephemeral=True, thinking=True)
+    guild = inter.guild
+    gid = str(guild.id)
+    atualizada = False
+    aviso = None
+    async with trava_servidor(guild.id):
+        anterior = cores_fila.get(gid)
+        if cor is None:
+            cores_fila.pop(gid, None)
+        else:
+            cores_fila[gid] = cor
+        try:
+            salvar_cores_fila()
+        except OSError as exc:
+            if anterior is None:
+                cores_fila.pop(gid, None)
+            else:
+                cores_fila[gid] = anterior
+            log.exception("Não foi possível salvar a cor permanente: %s", exc)
+            await inter.followup.send(
+                "⚠️ Não consegui salvar a cor em /data/queue_cores.json.", ephemeral=True
+            )
+            return
+
+        fila = filas.get(gid)
+        if fila and fila.get("status") == "aberta":
+            anterior_fila = fila.get("cor_embed")
+            fila["cor_embed"] = cor
+            try:
+                salvar_filas()
+            except OSError as exc:
+                log.warning("Falha ao atualizar cor em filas.json: %s", exc)
+                fila["cor_embed"] = anterior_fila
+                aviso = "⚠️ A fila aberta não foi atualizada no armazenamento."
+            else:
+                canal = guild.get_channel(fila.get("channel_id"))
+                if isinstance(canal, discord.TextChannel) and fila.get("message_id"):
+                    try:
+                        mensagem = await canal.fetch_message(fila["message_id"])
+                        await mensagem.edit(
+                            embed=montar_embed_fila(fila),
+                            view=FilaView(
+                                cheia=fila_cheia(fila),
+                                pagina=fila_pagina(fila),
+                                paginas=fila_total_paginas(fila),
+                            ),
+                            **opcoes_imagem_edicao_fila(guild.id, fila, mensagem),
+                        )
+                        atualizada = True
+                    except (discord.HTTPException, OSError, ValueError) as exc:
+                        log.warning("Cor salva, mas painel aberto não atualizado: %s", exc)
+                        aviso = "⚠️ A fila aberta não foi atualizada. A próxima fila usará a cor salva."
+
+    texto = (
+        "✅ Cor padrão restaurada!" if cor is None
+        else f"✅ Cor **{cor}** salva permanentemente!"
+    )
+    if atualizada:
+        texto += " O painel que já estava aberto também foi atualizado."
+    if aviso:
+        texto += "\n" + aviso
+    await inter.followup.send(
+        texto,
+        embed=discord.Embed(
+            title="🎨 Prévia da cor do painel",
+            description="Esta será a cor lateral do embed da fila.",
+            color=int(cor[1:], 16) if cor else 0x5865F2,
+        ),
+        ephemeral=True,
+    )
+
+
+class ModalCorQueue(discord.ui.Modal):
+    def __init__(self, usuario_id: int, guild_id: int):
+        super().__init__(title="Cor personalizada da fila", timeout=300)
+        self.usuario_id = usuario_id
+        self.guild_id = guild_id
+        self.entrada = discord.ui.Label(
+            text="Código hexadecimal (HEX)",
+            description="Exemplo: #FF1493 ou 5865F2",
+            component=discord.ui.TextInput(
+                placeholder="#FF1493", required=True, max_length=7,
+            ),
+        )
+        self.add_item(self.entrada)
+
+    async def on_submit(self, inter: discord.Interaction) -> None:
+        if inter.user.id != self.usuario_id or inter.guild_id != self.guild_id:
+            await inter.response.send_message("🚫 Este formulário não é seu.", ephemeral=True)
+            return
+        campo = self.entrada.component
+        assert isinstance(campo, discord.ui.TextInput)
+        await aplicar_cor_queue(inter, campo.value)
+
+
+class SeletorCorQueue(discord.ui.View):
+    def __init__(self, usuario_id: int, guild_id: int):
+        super().__init__(timeout=300)
+        self.usuario_id = usuario_id
+        self.guild_id = guild_id
+
+    async def interaction_check(self, inter: discord.Interaction) -> bool:
+        if inter.user.id != self.usuario_id or inter.guild_id != self.guild_id:
+            await inter.response.send_message(
+                "🚫 Somente quem abriu este menu pode alterar a cor.", ephemeral=True
+            )
+            return False
+        return True
+
+    @discord.ui.select(
+        placeholder="Escolha a cor do embed",
+        min_values=1,
+        max_values=1,
+        options=[
+            *[
+                discord.SelectOption(label=rotulo, value=hexadecimal)
+                for rotulo, hexadecimal in CORES_PREDEFINIDAS
+            ],
+            discord.SelectOption(label="🎨 Digitar minha cor HEX", value="personalizada"),
+            discord.SelectOption(label="🔄 Restaurar padrão", value="padrao"),
+        ],
+    )
+    async def escolher(self, inter: discord.Interaction, menu: discord.ui.Select) -> None:
+        escolha = menu.values[0]
+        if escolha == "personalizada":
+            await inter.response.send_modal(ModalCorQueue(self.usuario_id, self.guild_id))
+            return
+        await aplicar_cor_queue(inter, None if escolha == "padrao" else escolha)
+
+
+@bot.tree.command(
+    name="queue_cor", description="Personaliza a cor do embed da fila League of Legends"
+)
+@app_commands.guild_only()
+async def queue_cor(inter: discord.Interaction) -> None:
+    if inter.guild is None or not await dono_da_fila(inter):
+        await inter.response.send_message(
+            "🔒 Apenas o dono do servidor ou do bot pode alterar a cor.", ephemeral=True
+        )
+        return
+    atual = cores_fila.get(str(inter.guild.id))
+    cor = int(atual[1:], 16) if atual else 0x5865F2
+    embed = discord.Embed(
+        title="🎨 Personalizar cor do embed",
+        description=(
+            f"Cor atual: **{atual or 'Padrão (automática)'}**\n"
+            "Selecione uma cor pronta ou escolha **Digitar minha cor HEX**.\n"
+            "A escolha será aplicada à fila aberta e às próximas filas, mesmo após reiniciar."
+        ),
+        color=cor,
+    )
+    await inter.response.send_message(
+        embed=embed, view=SeletorCorQueue(inter.user.id, inter.guild.id), ephemeral=True
+    )
 
 
 @bot.tree.command(
