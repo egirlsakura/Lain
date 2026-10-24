@@ -24,7 +24,7 @@ BASE = Path(__file__).resolve().parent
 load_dotenv(BASE / ".env")
 TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 GUILD_ID = os.getenv("DISCORD_GUILD_ID", "").strip()
-ARQUIVO_PARTIDAS = BASE / "partidas.json"
+ARQUIVO_PARTIDAS = Path("/data/partidas.json")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("bot-partidas")
