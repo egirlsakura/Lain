@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import logging
 import os
@@ -163,6 +164,12 @@ class ClientePartidas(discord.Client):
                     FilaView(cheia=fila_cheia(fila)),
                     message_id=int(fila["message_id"]),
                 )
+        # O botão público Assistir continua ativo após um reinício do bot.
+        for partida in partidas.values():
+            if partida.get("assistir_message_id"):
+                self.add_view(
+                    AssistirView(), message_id=int(partida["assistir_message_id"])
+                )
         if GUILD_ID:
             try:
                 servidor = discord.Object(id=int(GUILD_ID))
@@ -190,11 +197,13 @@ async def devolver_jogadores(
     devolvidos = 0
     problemas = []
     participantes = partida.get("participantes", {})
+    espectadores = partida.get("espectadores", {})
     canal_padrao = buscar_voz(guild, partida.get("origem_id"))
 
     for canal in canal_times(guild, partida):
         for membro in list(canal.members):
-            cadastro = participantes.get(str(membro.id), {})
+            cadastro = (participantes.get(str(membro.id))
+                        or espectadores.get(str(membro.id)) or {})
             destino = buscar_voz(guild, cadastro.get("origem_id")) or canal_padrao
             if destino is None:
                 problemas.append(f"{membro.display_name}: canal original indisponível")
@@ -268,6 +277,15 @@ async def terminar_partida(interaction: discord.Interaction, vencedor: str | Non
         if vencedor and not anterior:
             partida["vencedor"] = vencedor
             salvar_partidas()
+
+        # Desativa o botão de espectador assim que a finalização começa.
+        canal_painel = guild.get_channel(partida.get("assistir_channel_id"))
+        if isinstance(canal_painel, discord.TextChannel) and partida.get("assistir_message_id"):
+            try:
+                painel = await canal_painel.fetch_message(partida["assistir_message_id"])
+                await painel.edit(view=None)
+            except (discord.Forbidden, discord.NotFound, discord.HTTPException) as exc:
+                log.warning("Não consegui desativar o botão Assistir: %s", exc)
 
         devolvidos, problemas = await devolver_jogadores(guild, partida)
         # Dá ao Discord um curto intervalo para atualizar os estados de voz.
@@ -559,13 +577,13 @@ def montar_embed_fila(fila: dict[str, Any]) -> discord.Embed:
     capacidade = TAMANHO_TIME * numero
     cheio = len(inscritos) == capacidade
     embed = discord.Embed(
-        title="🎮 QUEUE | FILA PARA PARTIDA",
+        title="🎮 League of Legends | FILA PARA PARTIDA",
         description=(
             f"🎙️ **Sala de espera:** <#{fila['origem_id']}>\n"
             f"👥 **Vagas preenchidas:** {len(inscritos)}/{capacidade}\n"
             f"🏅 **Equipes:** {numero} times de {TAMANHO_TIME} jogadores\n\n"
             + (
-                "✅ **Fila completa! O botão INICIAR está disponível para o dono.**"
+                "✅ **Fila completa! O botão Iniciar está disponível para o dono.**"
                 if cheio else "Clique em **Entrar** para participar ou **Sair** para cancelar."
             )
         ),
@@ -573,14 +591,18 @@ def montar_embed_fila(fila: dict[str, Any]) -> discord.Embed:
     )
     for n, (chave, emoji, nome) in enumerate(EQUIPES[:numero]):
         fatia = inscritos[n * TAMANHO_TIME:(n + 1) * TAMANHO_TIME]
+        # Sem numeração: cada lado tem cinco menções ou espaços livres.
         linhas = [
-            f"**{i + 1}.** <@{fatia[i]}>" if i < len(fatia) else f"**{i + 1}.** ⬜ Livre"
+            f"<@{fatia[i]}>" if i < len(fatia) else "⬜ Livre"
             for i in range(TAMANHO_TIME)
         ]
         embed.add_field(name=f"{emoji} Coluna {nome}", value="\n".join(linhas), inline=True)
-        # Garante no máximo duas colunas por linha no Discord.
+        # Duas colunas por linha. Para 5 equipes, haverá três linhas no painel.
         if n % 2 == 1 and n < numero - 1:
             embed.add_field(name="\u200b", value="\u200b", inline=False)
+    if fila.get("imagem_nome"):
+        # O arquivo foi enviado como anexo na própria mensagem pública da fila.
+        embed.set_image(url=f"attachment://{fila['imagem_nome']}")
     embed.set_footer(text="As colunas são vagas de inscrição; os times só serão sorteados ao iniciar.")
     return embed
 
@@ -615,9 +637,12 @@ async def atualizar_mensagem_fila(
                 if cancelada else "A partida começou. Confira abaixo a mensagem com os times sorteados."
             )
             embed.color = 0xF59E0B
-            await mensagem.edit(embed=embed, view=None)
+            await mensagem.edit(embed=embed, view=None, attachments=mensagem.attachments)
         else:
-            await mensagem.edit(embed=montar_embed_fila(fila), view=FilaView(cheia=fila_cheia(fila)))
+            await mensagem.edit(
+                embed=montar_embed_fila(fila), view=FilaView(cheia=fila_cheia(fila)),
+                attachments=mensagem.attachments,
+            )
     except (discord.Forbidden, discord.NotFound, discord.HTTPException) as exc:
         log.warning("Não foi possível atualizar a mensagem da fila: %s", exc)
 
@@ -677,6 +702,7 @@ class FilaView(discord.ui.View):
             salvar_filas()
             await inter.response.edit_message(
                 embed=montar_embed_fila(fila), view=FilaView(cheia=fila_cheia(fila)),
+                attachments=inter.message.attachments,
                 allowed_mentions=discord.AllowedMentions.none(),
             )
 
@@ -700,6 +726,7 @@ class FilaView(discord.ui.View):
             salvar_filas()
             await inter.response.edit_message(
                 embed=montar_embed_fila(fila), view=FilaView(cheia=False),
+                attachments=inter.message.attachments,
                 allowed_mentions=discord.AllowedMentions.none(),
             )
 
@@ -777,6 +804,9 @@ class FilaView(discord.ui.View):
                 "categoria_id": None,
                 "canais": {},
                 "vencedor": None,
+                "espectadores": {},
+                "assistir_channel_id": None,
+                "assistir_message_id": None,
                 "participantes": {
                     str(m.id): {"origem_id": origem.id, "time": chave}
                     for chave, membros in times.items() for m in membros
@@ -797,7 +827,9 @@ class FilaView(discord.ui.View):
                         f"{emoji} Time {nome} 🔒",
                         category=categoria,
                         overwrites=permissao,
-                        user_limit=TAMANHO_TIME,
+                        # Um limite de cinco impediria espectadores com o time completo.
+                        # A entrada continua protegida pelas permissões individuais.
+                        user_limit=0,
                         reason=f"Queue: canal privado do Time {nome}",
                     )
                     partida["canais"][chave] = canal.id
@@ -843,7 +875,7 @@ class FilaView(discord.ui.View):
             salvar_filas()
             await atualizar_mensagem_fila(guild, fila, fechada=True)
             embed = discord.Embed(
-                title="🎮 PARTIDA INICIADA | EQUIPES SORTEADAS",
+                title="🎮 League of Legends | EQUIPES SORTEADAS",
                 description=(
                     f"🔒 Cada time tem um canal privado: apenas membros sorteados "
                     f"podem conectar.\n🎙️ Canal original: {origem.mention}\n"
@@ -864,10 +896,13 @@ class FilaView(discord.ui.View):
             canal_texto = guild.get_channel(fila["channel_id"])
             if isinstance(canal_texto, discord.TextChannel):
                 try:
-                    await canal_texto.send(
-                        content=texto, embed=embed,
+                    mensagem_resultado = await canal_texto.send(
+                        content=texto, embed=embed, view=AssistirView(),
                         allowed_mentions=discord.AllowedMentions.none(),
                     )
+                    partida["assistir_channel_id"] = canal_texto.id
+                    partida["assistir_message_id"] = mensagem_resultado.id
+                    salvar_partidas()
                 except (discord.Forbidden, discord.HTTPException) as exc:
                     log.warning("Não foi possível divulgar o resultado: %s", exc)
             await inter.followup.send(
@@ -876,10 +911,176 @@ class FilaView(discord.ui.View):
             )
 
 
+# ======================= ASSISTIR PARTIDA =======================
+# O espectador recebe acesso exclusivamente ao canal escolhido e pode falar.
+# Administradores podem ignorar restrições de canais do Discord.
+
+class EscolhaEquipeAssistir(discord.ui.View):
+    def __init__(self, usuario_id: int, guild_id: int) -> None:
+        super().__init__(timeout=180)
+        self.usuario_id = usuario_id
+        self.guild_id = guild_id
+        partida = partidas.get(str(guild_id)) or {}
+        chaves = set((partida.get("canais") or {}).keys())
+        for chave, emoji, nome in EQUIPES:
+            if chave not in chaves:
+                continue
+            botao = discord.ui.Button(
+                label=nome, emoji=emoji, style=discord.ButtonStyle.primary,
+            )
+
+            async def escolher(inter: discord.Interaction, time: str = chave) -> None:
+                await self.escolher_time(inter, time)
+
+            botao.callback = escolher
+            self.add_item(botao)
+
+    async def interaction_check(self, inter: discord.Interaction) -> bool:
+        if inter.user.id != self.usuario_id or inter.guild_id != self.guild_id:
+            await inter.response.send_message(
+                "🚫 Apenas quem pediu para assistir pode escolher o time.", ephemeral=True
+            )
+            return False
+        return True
+
+    async def escolher_time(self, inter: discord.Interaction, time: str) -> None:
+        if inter.guild is None or not isinstance(inter.user, discord.Member):
+            await inter.response.send_message("Use este botão no servidor.", ephemeral=True)
+            return
+        await inter.response.defer(ephemeral=True, thinking=True)
+        async with trava_servidor(inter.guild.id):
+            partida = partidas.get(str(inter.guild.id))
+            if not partida or partida.get("vencedor") is not None:
+                await inter.followup.send("⚠️ A partida já terminou ou está sendo finalizada.")
+                return
+            if time not in (partida.get("canais") or {}):
+                await inter.followup.send("⚠️ Esse time não está disponível.")
+                return
+            if str(inter.user.id) in partida.get("participantes", {}):
+                await inter.followup.send("🎮 Você já é jogador desta partida.")
+                return
+
+            ja_registrado = partida.setdefault("espectadores", {}).get(str(inter.user.id))
+            if ja_registrado and ja_registrado["time"] != time:
+                await inter.followup.send(
+                    "🔒 Você já escolheu um time para assistir nesta partida. "
+                    "Não é possível trocar de equipe durante o jogo."
+                )
+                return
+
+            voz = inter.user.voice
+            if voz is None or voz.channel is None:
+                await inter.followup.send(
+                    "🎙️ Entre em qualquer canal de voz (de preferência a sala de espera) "
+                    "e clique novamente para assistir."
+                )
+                return
+
+            canal = buscar_voz(inter.guild, partida["canais"].get(time))
+            bot_membro = inter.guild.me
+            if not canal or bot_membro is None:
+                await inter.followup.send("⚠️ Canal da equipe indisponível.")
+                return
+            if not (
+                canal.permissions_for(bot_membro).manage_roles
+                and canal.permissions_for(bot_membro).move_members
+            ):
+                await inter.followup.send(
+                    "⚠️ O bot precisa de Gerenciar Cargos e Mover Membros neste canal."
+                )
+                return
+
+            overwrite_anterior = canal.overwrites_for(inter.user)
+            try:
+                # Espectador pode conectar, ouvir e falar no time escolhido.
+                # O outro time continua sem autorizar sua entrada.
+                await canal.set_permissions(
+                    inter.user,
+                    overwrite=discord.PermissionOverwrite(
+                        view_channel=True,
+                        connect=True,
+                        speak=True,
+                        stream=True,
+                        use_voice_activation=True,
+                    ),
+                    reason="League of Legends: espectador autorizado a falar no time escolhido",
+                )
+                if voz.channel.id != canal.id:
+                    await inter.user.move_to(
+                        canal, reason="League of Legends: assistir time escolhido"
+                    )
+            except (discord.Forbidden, discord.HTTPException) as exc:
+                log.warning("Não consegui mover espectador %s: %s", inter.user.id, exc)
+                try:
+                    await canal.set_permissions(
+                        inter.user, overwrite=overwrite_anterior,
+                        reason="Reverter autorização de espectador que não conseguiu entrar",
+                    )
+                except (discord.Forbidden, discord.HTTPException):
+                    log.exception("Falha ao restaurar permissão do espectador")
+                await inter.followup.send(
+                    "❌ Não consegui movê-lo. Confira minhas permissões de voz e cargos."
+                )
+                return
+
+            # Guarda a origem para devolver o espectador quando a partida terminar.
+            if not ja_registrado:
+                partida["espectadores"][str(inter.user.id)] = {
+                    "time": time,
+                    "origem_id": voz.channel.id,
+                }
+                salvar_partidas()
+            emoji, nome = next((e, n) for c, e, n in EQUIPES if c == time)
+            await inter.followup.send(
+                f"👀 Você está assistindo ao **Time {emoji} {nome}** em {canal.mention}. "
+                "Você pode ouvir e falar normalmente neste canal."
+            )
+
+
+class AssistirView(discord.ui.View):
+    """Botão público persistente na mensagem de times sorteados."""
+
+    def __init__(self) -> None:
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Assistir", emoji="👀", style=discord.ButtonStyle.secondary,
+        custom_id="queue:assistir",
+    )
+    async def assistir(self, inter: discord.Interaction, botao: discord.ui.Button) -> None:
+        if inter.guild is None or not isinstance(inter.user, discord.Member):
+            await inter.response.send_message("Use este botão dentro do servidor.", ephemeral=True)
+            return
+        partida = partidas.get(str(inter.guild.id))
+        if (not partida or not inter.message or
+                partida.get("assistir_message_id") != inter.message.id):
+            await inter.response.send_message(
+                "⚠️ Essa partida já terminou ou o painel foi substituído.", ephemeral=True
+            )
+            return
+        if str(inter.user.id) in partida.get("participantes", {}):
+            await inter.response.send_message(
+                "🎮 Você já participa de um time nesta partida.", ephemeral=True
+            )
+            return
+        canais = partida.get("canais") or {}
+        if set(canais) == {"vermelho", "azul"}:
+            pergunta = "👀 **Quer assistir à equipe Vermelha ou Azul?**"
+        else:
+            pergunta = "👀 **Qual equipe você quer assistir?**"
+        await inter.response.send_message(
+            pergunta + "\nVocê poderá ouvir e falar no canal escolhido. Não será possível trocar de time durante a partida.",
+            view=EscolhaEquipeAssistir(inter.user.id, inter.guild.id),
+            ephemeral=True,
+        )
+
+
 @bot.tree.command(name="queue", description="Abre uma fila com 5 jogadores por equipe e sorteio ao iniciar")
 @app_commands.describe(
     equipes="Número de equipes (de 2 a 6, com 5 jogadores em cada)",
     canal="Sala de voz de espera; se vazio, usa a sala em que você está",
+    imagem="Foto ou GIF para aparecer no embed da fila (opcional)",
+    link_imagem="Link HTTPS direto para foto ou GIF (opcional)",
 )
 @app_commands.guild_only()
 @app_commands.default_permissions(manage_channels=True)
@@ -887,6 +1088,8 @@ async def queue(
     inter: discord.Interaction,
     equipes: app_commands.Range[int, 2, 6] = 2,
     canal: discord.VoiceChannel | None = None,
+    imagem: discord.Attachment | None = None,
+    link_imagem: str | None = None,
 ) -> None:
     if inter.guild is None or not autorizado(inter):
         await inter.response.send_message(
@@ -906,7 +1109,35 @@ async def queue(
         await inter.response.send_message("Use /queue em um canal de texto.", ephemeral=True)
         return
 
+    if imagem is not None and link_imagem:
+        await inter.response.send_message(
+            "⚠️ Escolha apenas uma imagem: arquivo OU link.", ephemeral=True
+        )
+        return
+
     await inter.response.defer(thinking=True)
+    # Converte tanto arquivo como link em anexo do próprio painel do Discord.
+    # Isso mantém o GIF e a imagem quando a fila for atualizada.
+    imagem_dados = None
+    imagem_nome = None
+    if imagem is not None or link_imagem:
+        try:
+            imagem_dados = await obter_imagem(imagem, link_imagem)
+            extensao = {"PNG": "png", "JPG": "jpg", "GIF": "gif", "WEBP": "webp"}[
+                tipo_imagem(imagem_dados)
+            ]
+            imagem_nome = f"painel_lol.{extensao}"
+        except ValueError as exc:
+            await inter.followup.send(f"⚠️ {exc}", ephemeral=True)
+            return
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
+            log.warning("Falha ao buscar imagem da queue: %s", exc)
+            await inter.followup.send(
+                "⚠️ Não consegui receber a imagem. Confira o arquivo ou link HTTPS.",
+                ephemeral=True,
+            )
+            return
+
     async with trava_servidor(guild.id):
         if str(guild.id) in filas:
             await inter.followup.send("⚠️ Já existe uma fila aberta neste servidor.", ephemeral=True)
@@ -921,13 +1152,17 @@ async def queue(
             "message_id": None,
             "inscritos": [],
             "status": "aberta",
+            "imagem_nome": imagem_nome,
         }
-        mensagem = await inter.followup.send(
-            embed=montar_embed_fila(fila),
-            view=FilaView(cheia=False),
-            wait=True,
-            allowed_mentions=discord.AllowedMentions.none(),
-        )
+        envio = {
+            "embed": montar_embed_fila(fila),
+            "view": FilaView(cheia=False),
+            "wait": True,
+            "allowed_mentions": discord.AllowedMentions.none(),
+        }
+        if imagem_dados is not None:
+            envio["file"] = discord.File(io.BytesIO(imagem_dados), filename=imagem_nome)
+        mensagem = await inter.followup.send(**envio)
         fila["message_id"] = mensagem.id
         filas[str(guild.id)] = fila
         salvar_filas()
