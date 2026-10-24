@@ -27,8 +27,10 @@ TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 GUILD_ID = os.getenv("DISCORD_GUILD_ID", "").strip()
 ARQUIVO_PARTIDAS = Path("/data/partidas.json")
 ARQUIVO_FILAS = Path("/data/filas.json")
+ARQUIVO_IMAGENS_FILA = Path("/data/queue_imagens.json")
+PASTA_IMAGENS_FILA = Path("/data/queue_imagens")
 TAMANHO_TIME = 5
-# Duas equipes inicialmente; até seis equipes de cinco participantes.
+# De 2 a 6 equipes de cinco participantes; o painel visual tem SEMPRE duas colunas.
 EQUIPES = (
     ("vermelho", "🔴", "Vermelho"),
     ("azul", "🔵", "Azul"),
@@ -74,6 +76,74 @@ def carregar_filas() -> dict[str, dict[str, Any]]:
 
 
 filas = carregar_filas()
+
+
+def carregar_config_imagens() -> dict[str, dict[str, str]]:
+    if not ARQUIVO_IMAGENS_FILA.exists():
+        return {}
+    try:
+        dados = json.loads(ARQUIVO_IMAGENS_FILA.read_text(encoding="utf-8"))
+        if not isinstance(dados, dict):
+            raise ValueError("Configuração inválida")
+        return dados
+    except (json.JSONDecodeError, ValueError, OSError) as exc:
+        raise SystemExit(f"Erro ao ler queue_imagens.json: {exc}") from exc
+
+
+imagens_fila = carregar_config_imagens()
+
+
+def salvar_config_imagens() -> None:
+    ARQUIVO_IMAGENS_FILA.parent.mkdir(parents=True, exist_ok=True)
+    temporario = ARQUIVO_IMAGENS_FILA.with_suffix(".json.tmp")
+    temporario.write_text(
+        json.dumps(imagens_fila, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    temporario.replace(ARQUIVO_IMAGENS_FILA)
+
+
+def guardar_imagem_fila(guild_id: int, dados: bytes) -> str:
+    """Guarda em /data, que persiste entre redeploys no FadeHost."""
+    formato = tipo_imagem(dados)
+    if formato is None or len(dados) > LIMITE_BYTES:
+        raise ValueError("Use PNG, JPG, GIF ou WEBP de até 10 MB.")
+    extensao = {"PNG": "png", "JPG": "jpg", "GIF": "gif", "WEBP": "webp"}[formato]
+    nome = f"painel_lol_{guild_id}.{extensao}"
+    PASTA_IMAGENS_FILA.mkdir(parents=True, exist_ok=True)
+    caminho = PASTA_IMAGENS_FILA / nome
+    temporario = PASTA_IMAGENS_FILA / f"{guild_id}.upload.tmp"
+    try:
+        temporario.write_bytes(dados)
+        temporario.replace(caminho)
+        anterior = imagens_fila.get(str(guild_id), {}).get("nome")
+        imagens_fila[str(guild_id)] = {"nome": nome}
+        salvar_config_imagens()
+        if anterior and anterior != nome:
+            (PASTA_IMAGENS_FILA / anterior).unlink(missing_ok=True)
+        return nome
+    finally:
+        temporario.unlink(missing_ok=True)
+
+
+def imagem_fila_salva(guild_id: int) -> tuple[bytes, str] | None:
+    registro = imagens_fila.get(str(guild_id))
+    if not registro:
+        return None
+    nome = registro.get("nome", "")
+    if not nome or Path(nome).name != nome:
+        return None
+    caminho = PASTA_IMAGENS_FILA / nome
+    try:
+        dados = caminho.read_bytes()
+    except OSError:
+        log.warning("Imagem padrão da fila não encontrada: %s", caminho)
+        return None
+    if tipo_imagem(dados) is None or len(dados) > LIMITE_BYTES:
+        log.warning("Imagem padrão da fila é inválida: %s", caminho)
+        return None
+    return dados, nome
+
+
 # Se reiniciou enquanto uma fila estava iniciando, a partida já está salva.
 for _gid, _fila in list(filas.items()):
     if _fila.get("status") == "iniciando":
@@ -161,7 +231,7 @@ class ClientePartidas(discord.Client):
         for fila in filas.values():
             if fila.get("status") == "aberta" and fila.get("message_id"):
                 self.add_view(
-                    FilaView(cheia=fila_cheia(fila)),
+                    FilaView(cheia=fila_cheia(fila), pagina=fila_pagina(fila), paginas=fila_total_paginas(fila)),
                     message_id=int(fila["message_id"]),
                 )
         # O botão público Assistir continua ativo após um reinício do bot.
@@ -183,6 +253,30 @@ class ClientePartidas(discord.Client):
 
     async def on_ready(self) -> None:
         log.info("Conectado como %s | %s partida(s) registrada(s)", self.user, len(partidas))
+        if getattr(self, "_imagens_fila_recuperadas", False):
+            return
+        self._imagens_fila_recuperadas = True
+        # Recupera também a imagem do painel da versão anterior, caso ainda
+        # exista no Discord e ainda não tenha sido salva em /data.
+        for guild_id, fila in list(filas.items()):
+            if (not fila.get("imagem_nome") or not fila.get("message_id")
+                    or str(guild_id) in imagens_fila):
+                continue
+            canal = self.get_channel(fila.get("channel_id"))
+            if not isinstance(canal, discord.TextChannel):
+                continue
+            try:
+                mensagem = await canal.fetch_message(fila["message_id"])
+                anexo = next(
+                    (a for a in mensagem.attachments
+                     if a.filename == fila.get("imagem_nome") and a.size <= LIMITE_BYTES),
+                    None,
+                )
+                if anexo is not None:
+                    guardar_imagem_fila(int(guild_id), await anexo.read())
+                    log.info("Imagem antiga da fila recuperada para o servidor %s", guild_id)
+            except (discord.HTTPException, OSError, ValueError) as exc:
+                log.warning("Não foi possível recuperar a imagem antiga da fila: %s", exc)
 
 
 bot = ClientePartidas()
@@ -571,11 +665,22 @@ def fila_cheia(fila: dict[str, Any]) -> bool:
     return len(fila.get("inscritos", [])) == TAMANHO_TIME * int(fila["equipes"])
 
 
+def fila_total_paginas(fila: dict[str, Any]) -> int:
+    # Duas colunas de cinco vagas por página, mesmo para até 25 inscritos.
+    capacidade = TAMANHO_TIME * int(fila["equipes"])
+    return max(1, (capacidade + 9) // 10)
+
+
+def fila_pagina(fila: dict[str, Any]) -> int:
+    return min(max(0, int(fila.get("pagina", 0))), fila_total_paginas(fila) - 1)
+
+
 def montar_embed_fila(fila: dict[str, Any]) -> discord.Embed:
     numero = int(fila["equipes"])
     inscritos = fila.get("inscritos", [])
     capacidade = TAMANHO_TIME * numero
     cheio = len(inscritos) == capacidade
+    pagina = fila_pagina(fila)
     embed = discord.Embed(
         title="🎮 League of Legends | FILA PARA PARTIDA",
         description=(
@@ -589,21 +694,24 @@ def montar_embed_fila(fila: dict[str, Any]) -> discord.Embed:
         ),
         color=0x22C55E if cheio else 0x5865F2,
     )
-    for n, (chave, emoji, nome) in enumerate(EQUIPES[:numero]):
-        fatia = inscritos[n * TAMANHO_TIME:(n + 1) * TAMANHO_TIME]
-        # Sem numeração: cada lado tem cinco menções ou espaços livres.
-        linhas = [
-            f"<@{fatia[i]}>" if i < len(fatia) else "⬜ Livre"
-            for i in range(TAMANHO_TIME)
-        ]
+    # Sempre exatamente duas colunas. Páginas extras não criam novas colunas.
+    for coluna, (emoji, nome) in enumerate((("🔴", "Vermelho"), ("🔵", "Azul"))):
+        inicio = pagina * 10 + coluna * TAMANHO_TIME
+        linhas = []
+        for indice in range(inicio, inicio + TAMANHO_TIME):
+            if indice >= capacidade:
+                linhas.append("▫️ Sem vaga")
+            elif indice < len(inscritos):
+                linhas.append(f"<@{inscritos[indice]}>")
+            else:
+                linhas.append("⬜ Livre")
         embed.add_field(name=f"{emoji} Coluna {nome}", value="\n".join(linhas), inline=True)
-        # Duas colunas por linha. Para 5 equipes, haverá três linhas no painel.
-        if n % 2 == 1 and n < numero - 1:
-            embed.add_field(name="\u200b", value="\u200b", inline=False)
     if fila.get("imagem_nome"):
-        # O arquivo foi enviado como anexo na própria mensagem pública da fila.
         embed.set_image(url=f"attachment://{fila['imagem_nome']}")
-    embed.set_footer(text="As colunas são vagas de inscrição; os times só serão sorteados ao iniciar.")
+    rodape = "As colunas são vagas de inscrição; os times só serão sorteados ao iniciar."
+    if fila_total_paginas(fila) > 1:
+        rodape = f"Inscrições {pagina + 1}/{fila_total_paginas(fila)} | " + rodape
+    embed.set_footer(text=rodape)
     return embed
 
 
@@ -640,7 +748,9 @@ async def atualizar_mensagem_fila(
             await mensagem.edit(embed=embed, view=None, attachments=mensagem.attachments)
         else:
             await mensagem.edit(
-                embed=montar_embed_fila(fila), view=FilaView(cheia=fila_cheia(fila)),
+                embed=montar_embed_fila(fila), view=FilaView(
+                    cheia=fila_cheia(fila), pagina=fila_pagina(fila), paginas=fila_total_paginas(fila)
+                ),
                 attachments=mensagem.attachments,
             )
     except (discord.Forbidden, discord.NotFound, discord.HTTPException) as exc:
@@ -660,12 +770,18 @@ def valida_fila_interacao(inter: discord.Interaction) -> dict[str, Any] | None:
 class FilaView(discord.ui.View):
     """Botões persistentes, restaurados no reinício com o ID da mensagem."""
 
-    def __init__(self, cheia: bool) -> None:
+    def __init__(self, cheia: bool, pagina: int = 0, paginas: int = 1) -> None:
         super().__init__(timeout=None)
         if cheia:
             self.remove_item(self.entrar)
         else:
             self.remove_item(self.iniciar)
+        if paginas <= 1:
+            self.remove_item(self.anterior)
+            self.remove_item(self.proximo)
+        else:
+            self.anterior.disabled = pagina <= 0
+            self.proximo.disabled = pagina >= paginas - 1
 
     @discord.ui.button(
         label="Entrar", emoji="✅", style=discord.ButtonStyle.success,
@@ -701,7 +817,9 @@ class FilaView(discord.ui.View):
             fila["inscritos"].append(uid)
             salvar_filas()
             await inter.response.edit_message(
-                embed=montar_embed_fila(fila), view=FilaView(cheia=fila_cheia(fila)),
+                embed=montar_embed_fila(fila), view=FilaView(
+                    cheia=fila_cheia(fila), pagina=fila_pagina(fila), paginas=fila_total_paginas(fila)
+                ),
                 attachments=inter.message.attachments,
                 allowed_mentions=discord.AllowedMentions.none(),
             )
@@ -725,7 +843,44 @@ class FilaView(discord.ui.View):
             fila["inscritos"].remove(inter.user.id)
             salvar_filas()
             await inter.response.edit_message(
-                embed=montar_embed_fila(fila), view=FilaView(cheia=False),
+                embed=montar_embed_fila(fila), view=FilaView(cheia=False, pagina=fila_pagina(fila), paginas=fila_total_paginas(fila)),
+                attachments=inter.message.attachments,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+
+    @discord.ui.button(
+        label="Anterior", emoji="◀️", style=discord.ButtonStyle.secondary,
+        custom_id="queue:anterior", row=1,
+    )
+    async def anterior(self, inter: discord.Interaction, botao: discord.ui.Button) -> None:
+        await self.trocar_pagina(inter, -1)
+
+    @discord.ui.button(
+        label="Próxima", emoji="▶️", style=discord.ButtonStyle.secondary,
+        custom_id="queue:proximo", row=1,
+    )
+    async def proximo(self, inter: discord.Interaction, botao: discord.ui.Button) -> None:
+        await self.trocar_pagina(inter, 1)
+
+    async def trocar_pagina(self, inter: discord.Interaction, diferenca: int) -> None:
+        if inter.guild is None:
+            await inter.response.send_message("Fila indisponível.", ephemeral=True)
+            return
+        async with trava_servidor(inter.guild.id):
+            fila = valida_fila_interacao(inter)
+            if fila is None:
+                await inter.response.send_message("⚠️ A fila foi encerrada.", ephemeral=True)
+                return
+            fila["pagina"] = min(
+                max(0, fila_pagina(fila) + diferenca), fila_total_paginas(fila) - 1
+            )
+            salvar_filas()
+            await inter.response.edit_message(
+                embed=montar_embed_fila(fila),
+                view=FilaView(
+                    cheia=fila_cheia(fila), pagina=fila_pagina(fila),
+                    paginas=fila_total_paginas(fila),
+                ),
                 attachments=inter.message.attachments,
                 allowed_mentions=discord.AllowedMentions.none(),
             )
@@ -1079,8 +1234,8 @@ class AssistirView(discord.ui.View):
 @app_commands.describe(
     equipes="Número de equipes (de 2 a 6, com 5 jogadores em cada)",
     canal="Sala de voz de espera; se vazio, usa a sala em que você está",
-    imagem="Foto ou GIF para aparecer no embed da fila (opcional)",
-    link_imagem="Link HTTPS direto para foto ou GIF (opcional)",
+    imagem="Foto/GIF para salvar como imagem padrão da fila (opcional)",
+    link_imagem="Link HTTPS direto para salvar como imagem padrão (opcional)",
 )
 @app_commands.guild_only()
 @app_commands.default_permissions(manage_channels=True)
@@ -1116,17 +1271,14 @@ async def queue(
         return
 
     await inter.response.defer(thinking=True)
-    # Converte tanto arquivo como link em anexo do próprio painel do Discord.
-    # Isso mantém o GIF e a imagem quando a fila for atualizada.
+    # Imagem enviada aqui também se torna a padrão das próximas filas.
+    # Sem upload/link, reutiliza o arquivo salvo de forma persistente em /data.
     imagem_dados = None
     imagem_nome = None
-    if imagem is not None or link_imagem:
+    imagem_nova = imagem is not None or bool(link_imagem)
+    if imagem_nova:
         try:
             imagem_dados = await obter_imagem(imagem, link_imagem)
-            extensao = {"PNG": "png", "JPG": "jpg", "GIF": "gif", "WEBP": "webp"}[
-                tipo_imagem(imagem_dados)
-            ]
-            imagem_nome = f"painel_lol.{extensao}"
         except ValueError as exc:
             await inter.followup.send(f"⚠️ {exc}", ephemeral=True)
             return
@@ -1145,8 +1297,21 @@ async def queue(
         if str(guild.id) in partidas:
             await inter.followup.send("⚠️ Finalize a partida atual antes de abrir uma fila.", ephemeral=True)
             return
+        if imagem_nova:
+            try:
+                imagem_nome = guardar_imagem_fila(guild.id, imagem_dados)
+            except (OSError, ValueError) as exc:
+                log.warning("Falha ao salvar imagem da fila: %s", exc)
+                await inter.followup.send("⚠️ Não consegui salvar a imagem em /data.", ephemeral=True)
+                return
+        else:
+            padrao = imagem_fila_salva(guild.id)
+            if padrao is not None:
+                imagem_dados, imagem_nome = padrao
+
         fila: dict[str, Any] = {
             "equipes": equipes,
+            "pagina": 0,
             "origem_id": canal.id,
             "channel_id": inter.channel.id,
             "message_id": None,
@@ -1156,7 +1321,7 @@ async def queue(
         }
         envio = {
             "embed": montar_embed_fila(fila),
-            "view": FilaView(cheia=False),
+            "view": FilaView(cheia=False, pagina=0, paginas=fila_total_paginas(fila)),
             "wait": True,
             "allowed_mentions": discord.AllowedMentions.none(),
         }
@@ -1166,6 +1331,84 @@ async def queue(
         fila["message_id"] = mensagem.id
         filas[str(guild.id)] = fila
         salvar_filas()
+
+
+@bot.tree.command(
+    name="queue_imagem",
+    description="Salva uma foto/GIF permanente para o painel do /queue",
+)
+@app_commands.describe(
+    imagem="Foto ou GIF do painel (arquivo)",
+    link_imagem="Link HTTPS direto da foto ou GIF (alternativa ao arquivo)",
+)
+@app_commands.guild_only()
+@app_commands.default_permissions(manage_channels=True)
+async def queue_imagem(
+    inter: discord.Interaction,
+    imagem: discord.Attachment | None = None,
+    link_imagem: str | None = None,
+) -> None:
+    if inter.guild is None or not await dono_da_fila(inter):
+        await inter.response.send_message(
+            "🔒 Somente o dono do servidor ou do bot pode alterar a imagem da fila.",
+            ephemeral=True,
+        )
+        return
+    if bool(imagem) == bool(link_imagem):
+        await inter.response.send_message(
+            "⚠️ Envie uma foto/GIF em `imagem` OU use `link_imagem`.", ephemeral=True
+        )
+        return
+    await inter.response.defer(ephemeral=True, thinking=True)
+    try:
+        dados = await obter_imagem(imagem, link_imagem)
+    except ValueError as exc:
+        await inter.followup.send(f"⚠️ {exc}", ephemeral=True)
+        return
+    except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
+        log.warning("Erro de download da imagem padrão: %s", exc)
+        await inter.followup.send("⚠️ Não consegui baixar a foto/GIF.", ephemeral=True)
+        return
+
+    guild = inter.guild
+    async with trava_servidor(guild.id):
+        try:
+            nome = guardar_imagem_fila(guild.id, dados)
+        except (OSError, ValueError) as exc:
+            log.warning("Erro ao salvar imagem padrão: %s", exc)
+            await inter.followup.send("⚠️ Não consegui salvar em /data.", ephemeral=True)
+            return
+
+        alterada = False
+        fila = filas.get(str(guild.id))
+        if fila and fila.get("status") == "aberta":
+            canal = guild.get_channel(fila.get("channel_id"))
+            if isinstance(canal, discord.TextChannel):
+                try:
+                    mensagem = await canal.fetch_message(fila["message_id"])
+                    anterior = fila.get("imagem_nome")
+                    fila["imagem_nome"] = nome
+                    await mensagem.edit(
+                        embed=montar_embed_fila(fila),
+                        view=FilaView(
+                            cheia=fila_cheia(fila), pagina=fila_pagina(fila),
+                            paginas=fila_total_paginas(fila),
+                        ),
+                        attachments=[discord.File(io.BytesIO(dados), filename=nome)],
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                    salvar_filas()
+                    alterada = True
+                except (discord.Forbidden, discord.HTTPException, OSError) as exc:
+                    fila["imagem_nome"] = anterior
+                    log.warning("Não consegui trocar imagem do painel ativo: %s", exc)
+
+    await inter.followup.send(
+        "✅ **Imagem/GIF padrão salvo permanentemente!** "
+        "As próximas filas já usarão essa imagem automaticamente."
+        + (" O painel aberto também foi atualizado." if alterada else ""),
+        ephemeral=True,
+    )
 
 
 @bot.event
