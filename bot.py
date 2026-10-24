@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import hashlib
 import json
 import logging
 import os
@@ -103,45 +104,98 @@ def salvar_config_imagens() -> None:
 
 
 def guardar_imagem_fila(guild_id: int, dados: bytes) -> str:
-    """Guarda em /data, que persiste entre redeploys no FadeHost."""
+    """Salva a imagem completa no volume persistente do FadeHost, com verificação."""
     formato = tipo_imagem(dados)
-    if formato is None or len(dados) > LIMITE_BYTES:
+    if formato is None or not dados or len(dados) > LIMITE_BYTES:
         raise ValueError("Use PNG, JPG, GIF ou WEBP de até 10 MB.")
     extensao = {"PNG": "png", "JPG": "jpg", "GIF": "gif", "WEBP": "webp"}[formato]
-    nome = f"painel_lol_{guild_id}.{extensao}"
+    resumo = hashlib.sha256(dados).hexdigest()[:20]
+    # Nome pelo conteúdo: impede o Discord de reutilizar a imagem antiga em cache.
+    nome = f"painel_lol_{guild_id}_{resumo}.{extensao}"
     PASTA_IMAGENS_FILA.mkdir(parents=True, exist_ok=True)
     caminho = PASTA_IMAGENS_FILA / nome
-    temporario = PASTA_IMAGENS_FILA / f"{guild_id}.upload.tmp"
+    temporario = PASTA_IMAGENS_FILA / f"{guild_id}.{resumo}.tmp"
+    registro_antigo = imagens_fila.get(str(guild_id))
     try:
-        temporario.write_bytes(dados)
+        with temporario.open("wb") as destino:
+            destino.write(dados)
+            destino.flush()
+            os.fsync(destino.fileno())
         temporario.replace(caminho)
-        anterior = imagens_fila.get(str(guild_id), {}).get("nome")
-        imagens_fila[str(guild_id)] = {"nome": nome}
-        salvar_config_imagens()
-        if anterior and anterior != nome:
-            (PASTA_IMAGENS_FILA / anterior).unlink(missing_ok=True)
+        if caminho.read_bytes() != dados:
+            raise OSError("O arquivo salvo não corresponde à imagem enviada.")
+        imagens_fila[str(guild_id)] = {"nome": nome, "sha256": hashlib.sha256(dados).hexdigest()}
+        try:
+            salvar_config_imagens()
+        except OSError:
+            if registro_antigo is None:
+                imagens_fila.pop(str(guild_id), None)
+            else:
+                imagens_fila[str(guild_id)] = registro_antigo
+            raise
+        log.info("Imagem permanente da queue confirmada: %s (%s bytes)", caminho, len(dados))
+        # Não apaga a imagem antiga: filas já enviadas ainda podem precisar dela.
         return nome
     finally:
         temporario.unlink(missing_ok=True)
 
 
 def imagem_fila_salva(guild_id: int) -> tuple[bytes, str] | None:
-    registro = imagens_fila.get(str(guild_id))
-    if not registro:
-        return None
-    nome = registro.get("nome", "")
-    if not nome or Path(nome).name != nome:
-        return None
-    caminho = PASTA_IMAGENS_FILA / nome
-    try:
-        dados = caminho.read_bytes()
-    except OSError:
-        log.warning("Imagem padrão da fila não encontrada: %s", caminho)
-        return None
-    if tipo_imagem(dados) is None or len(dados) > LIMITE_BYTES:
-        log.warning("Imagem padrão da fila é inválida: %s", caminho)
-        return None
-    return dados, nome
+    """Carrega imagem persistida, recuperando registro caso o índice desapareça."""
+    registro = imagens_fila.get(str(guild_id)) or {}
+    nome_registrado = registro.get("nome", "")
+    candidatos = []
+    if nome_registrado and Path(nome_registrado).name == nome_registrado:
+        candidatos.append(PASTA_IMAGENS_FILA / nome_registrado)
+    if PASTA_IMAGENS_FILA.is_dir():
+        # Aceita também o formato antigo (painel_lol_ID.gif), sem migrar o upload.
+        for caminho in PASTA_IMAGENS_FILA.glob(f"painel_lol_{guild_id}.*"):
+            candidatos.append(caminho)
+        outros = list(PASTA_IMAGENS_FILA.glob(f"painel_lol_{guild_id}_*.*"))
+        candidatos.extend(sorted(outros, key=lambda p: p.stat().st_mtime, reverse=True))
+
+    for caminho in dict.fromkeys(candidatos):
+        try:
+            if not caminho.is_file() or caminho.stat().st_size > LIMITE_BYTES:
+                continue
+            dados = caminho.read_bytes()
+        except OSError:
+            continue
+        if not dados or tipo_imagem(dados) is None:
+            continue
+        digest = hashlib.sha256(dados).hexdigest()
+        if caminho.name == nome_registrado and registro.get("sha256") and registro["sha256"] != digest:
+            log.warning("Imagem padrão corrompida: %s", caminho)
+            continue
+        if nome_registrado != caminho.name:
+            imagens_fila[str(guild_id)] = {"nome": caminho.name, "sha256": digest}
+            salvar_config_imagens()
+            log.info("Configuração da imagem da queue recuperada: %s", caminho)
+        return dados, caminho.name
+
+    if registro:
+        raise FileNotFoundError(
+            "A imagem cadastrada não foi encontrada no armazenamento /data. "
+            "Envie-a novamente uma única vez usando /queue_imagem."
+        )
+    return None
+
+
+def anexos_para_fila(guild_id: int, fila: dict[str, Any], anexos: list) -> list:
+    """Impede que um edit do Discord remova a imagem do embed da fila."""
+    nome = fila.get("imagem_nome")
+    if not nome or any(a.filename == nome for a in anexos):
+        return anexos
+    imagem = imagem_fila_salva(guild_id)
+    if imagem is None:
+        raise FileNotFoundError("Imagem do painel indisponível. Use /queue_imagem.")
+    dados, nome = imagem
+    fila["imagem_nome"] = nome
+    salvar_filas()
+    # Reanexa do disco se o Discord perdeu a imagem após edição ou reinício.
+    outros = [a for a in anexos if not a.filename.startswith("painel_lol_")]
+    log.warning("Recuperando anexo perdido na mensagem da fila: servidor %s", guild_id)
+    return [*outros, discord.File(io.BytesIO(dados), filename=nome)]
 
 
 # Se reiniciou enquanto uma fila estava iniciando, a partida já está salva.
@@ -751,7 +805,7 @@ async def atualizar_mensagem_fila(
                 embed=montar_embed_fila(fila), view=FilaView(
                     cheia=fila_cheia(fila), pagina=fila_pagina(fila), paginas=fila_total_paginas(fila)
                 ),
-                attachments=mensagem.attachments,
+                attachments=anexos_para_fila(guild.id, fila, mensagem.attachments),
             )
     except (discord.Forbidden, discord.NotFound, discord.HTTPException) as exc:
         log.warning("Não foi possível atualizar a mensagem da fila: %s", exc)
@@ -820,7 +874,7 @@ class FilaView(discord.ui.View):
                 embed=montar_embed_fila(fila), view=FilaView(
                     cheia=fila_cheia(fila), pagina=fila_pagina(fila), paginas=fila_total_paginas(fila)
                 ),
-                attachments=inter.message.attachments,
+                attachments=anexos_para_fila(inter.guild.id, fila, inter.message.attachments),
                 allowed_mentions=discord.AllowedMentions.none(),
             )
 
@@ -844,7 +898,7 @@ class FilaView(discord.ui.View):
             salvar_filas()
             await inter.response.edit_message(
                 embed=montar_embed_fila(fila), view=FilaView(cheia=False, pagina=fila_pagina(fila), paginas=fila_total_paginas(fila)),
-                attachments=inter.message.attachments,
+                attachments=anexos_para_fila(inter.guild.id, fila, inter.message.attachments),
                 allowed_mentions=discord.AllowedMentions.none(),
             )
 
@@ -881,7 +935,7 @@ class FilaView(discord.ui.View):
                     cheia=fila_cheia(fila), pagina=fila_pagina(fila),
                     paginas=fila_total_paginas(fila),
                 ),
-                attachments=inter.message.attachments,
+                attachments=anexos_para_fila(inter.guild.id, fila, inter.message.attachments),
                 allowed_mentions=discord.AllowedMentions.none(),
             )
 
@@ -1305,9 +1359,15 @@ async def queue(
                 await inter.followup.send("⚠️ Não consegui salvar a imagem em /data.", ephemeral=True)
                 return
         else:
-            padrao = imagem_fila_salva(guild.id)
+            try:
+                padrao = imagem_fila_salva(guild.id)
+            except (OSError, ValueError) as exc:
+                log.error("Imagem persistente da fila indisponível: %s", exc)
+                await inter.followup.send(f"⚠️ {exc}", ephemeral=True)
+                return
             if padrao is not None:
                 imagem_dados, imagem_nome = padrao
+                log.info("Queue usando imagem salva em /data: %s", imagem_nome)
 
         fila: dict[str, Any] = {
             "equipes": equipes,
@@ -1328,6 +1388,19 @@ async def queue(
         if imagem_dados is not None:
             envio["file"] = discord.File(io.BytesIO(imagem_dados), filename=imagem_nome)
         mensagem = await inter.followup.send(**envio)
+        if imagem_dados is not None and not any(
+            a.filename == imagem_nome for a in mensagem.attachments
+        ):
+            log.error("Discord não anexou a imagem à mensagem da fila: %s", imagem_nome)
+            try:
+                await mensagem.delete()
+            except discord.HTTPException:
+                pass
+            await inter.followup.send(
+                "⚠️ A imagem foi salva, mas o Discord não a anexou ao painel. "
+                "Confira o tamanho/formato e tente /queue novamente.", ephemeral=True
+            )
+            return
         fila["message_id"] = mensagem.id
         filas[str(guild.id)] = fila
         salvar_filas()
@@ -1374,12 +1447,16 @@ async def queue_imagem(
     async with trava_servidor(guild.id):
         try:
             nome = guardar_imagem_fila(guild.id, dados)
+            leitura = imagem_fila_salva(guild.id)
+            if leitura is None or leitura[0] != dados:
+                raise OSError("Falha na verificação da imagem persistida.")
         except (OSError, ValueError) as exc:
             log.warning("Erro ao salvar imagem padrão: %s", exc)
-            await inter.followup.send("⚠️ Não consegui salvar em /data.", ephemeral=True)
+            await inter.followup.send(f"⚠️ Não consegui salvar em /data: {exc}", ephemeral=True)
             return
 
         alterada = False
+        falha_painel = None
         fila = filas.get(str(guild.id))
         if fila and fila.get("status") == "aberta":
             canal = guild.get_channel(fila.get("channel_id"))
@@ -1401,12 +1478,47 @@ async def queue_imagem(
                     alterada = True
                 except (discord.Forbidden, discord.HTTPException, OSError) as exc:
                     fila["imagem_nome"] = anterior
+                    falha_painel = str(exc)
                     log.warning("Não consegui trocar imagem do painel ativo: %s", exc)
 
     await inter.followup.send(
-        "✅ **Imagem/GIF padrão salvo permanentemente!** "
-        "As próximas filas já usarão essa imagem automaticamente."
-        + (" O painel aberto também foi atualizado." if alterada else ""),
+        "✅ **Imagem/GIF salva e conferida no armazenamento persistente!** "
+        "As próximas filas usarão essa imagem automaticamente."
+        + (" O painel aberto também foi atualizado." if alterada else "")
+        + (" ⚠️ O painel atual não foi atualizado. Faça /queue_cancelar e abra outra fila."
+           if falha_painel else ""),
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(
+    name="queue_imagem_status",
+    description="Confere se a foto/GIF padrão está salva permanentemente",
+)
+@app_commands.guild_only()
+async def queue_imagem_status(inter: discord.Interaction) -> None:
+    if inter.guild is None or not await dono_da_fila(inter):
+        await inter.response.send_message("🔒 Comando reservado ao dono.", ephemeral=True)
+        return
+    try:
+        salvo = imagem_fila_salva(inter.guild.id)
+    except (OSError, ValueError) as exc:
+        await inter.response.send_message(f"⚠️ {exc}", ephemeral=True)
+        return
+    if salvo is None:
+        await inter.response.send_message(
+            "ℹ️ Nenhuma foto/GIF padrão configurada. Use /queue_imagem uma única vez.",
+            ephemeral=True,
+        )
+        return
+    dados, nome = salvo
+    await inter.response.send_message(
+        f"✅ **Imagem persistente encontrada!**\n"
+        f"Arquivo: `{nome}`\n"
+        f"Formato: **{tipo_imagem(dados)}**\n"
+        f"Tamanho: **{len(dados) / 1024:.1f} KB**\n"
+        "Armazenamento: `/data/queue_imagens/`. "
+        "Se este status continuar OK depois do Redeploy, a imagem está salva.",
         ephemeral=True,
     )
 
