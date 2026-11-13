@@ -1289,6 +1289,12 @@ NOMES_FILAS_LOL = {
     1700: "Arena",
 }
 _nomes_campeoes: dict[int, str] = {}
+_ids_ddragon: dict[int, str] = {}  # Número do campeão -> nome interno (ex.: 62 -> MonkeyKing).
+_versao_ddragon = ""
+# Ícones dos campeões viram emojis da aplicação do bot (criados só quando aparecem).
+_emojis_campeoes: dict[str, str] = {}
+_emojis_carregados = False
+_trava_emojis = asyncio.Lock()
 # Partidas do LoL não mudam depois de terminar; guardamos um resumo para não reconsultar.
 _cache_partidas_lol: dict[str, dict[str, Any] | None] = {}
 _cache_estatisticas: dict[str, tuple[float, dict[str, Any]]] = {}
@@ -1296,6 +1302,7 @@ _cache_estatisticas: dict[str, tuple[float, dict[str, Any]]] = {}
 
 async def nomes_campeoes() -> dict[int, str]:
     """Nomes dos campeões em português, pelo Data Dragon público da Riot."""
+    global _versao_ddragon
     if _nomes_campeoes:
         return _nomes_campeoes
     timeout = aiohttp.ClientTimeout(total=10, connect=4)
@@ -1309,9 +1316,65 @@ async def nomes_campeoes() -> dict[int, str]:
                 dados = await r.json()
         for campeao in dados["data"].values():
             _nomes_campeoes[int(campeao["key"])] = campeao["name"]
+            _ids_ddragon[int(campeao["key"])] = campeao["id"]
+        _versao_ddragon = versao
     except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, KeyError, IndexError) as exc:
         log.warning("Não consegui carregar os nomes dos campeões: %s", exc)
     return _nomes_campeoes
+
+
+def nome_emoji_campeao(campeao_id: int) -> str:
+    # Emojis só aceitam letras, números e "_" (2 a 32 caracteres).
+    interno = re.sub(r"[^A-Za-z0-9_]", "", _ids_ddragon.get(campeao_id, str(campeao_id)))
+    return f"lol_{interno}"[:32]
+
+
+async def icones_campeoes(ids: set[int]) -> dict[int, str]:
+    """Ícone oficial de cada campeão (Data Dragon) como emoji da aplicação do bot.
+
+    O emoji é criado só na primeira vez que o campeão aparece e fica salvo no
+    Discord, então reinícios do bot não precisam enviar as imagens de novo.
+    """
+    global _emojis_carregados
+    if not _ids_ddragon or not _versao_ddragon:
+        return {}
+    async with _trava_emojis:
+        if not _emojis_carregados:
+            try:
+                for emoji in await bot.fetch_application_emojis():
+                    _emojis_campeoes[emoji.name] = str(emoji)
+                _emojis_carregados = True
+            except (discord.HTTPException, AttributeError) as exc:
+                log.warning("Não consegui listar os emojis do bot: %s", exc)
+                return {}
+        faltando = [
+            cid for cid in ids
+            if cid in _ids_ddragon and nome_emoji_campeao(cid) not in _emojis_campeoes
+        ]
+        if faltando:
+            timeout = aiohttp.ClientTimeout(total=10, connect=4)
+            async with aiohttp.ClientSession(timeout=timeout) as sessao:
+                for cid in faltando:
+                    url = (
+                        f"https://ddragon.leagueoflegends.com/cdn/{_versao_ddragon}"
+                        f"/img/champion/{quote(_ids_ddragon[cid], safe='')}.png"
+                    )
+                    try:
+                        async with sessao.get(url) as resposta:
+                            if resposta.status != 200:
+                                continue
+                            imagem = await resposta.read()
+                        emoji = await bot.create_application_emoji(
+                            name=nome_emoji_campeao(cid), image=imagem
+                        )
+                        _emojis_campeoes[emoji.name] = str(emoji)
+                    except (aiohttp.ClientError, asyncio.TimeoutError,
+                            discord.HTTPException, AttributeError) as exc:
+                        log.warning("Não consegui criar o ícone do campeão %s: %s", cid, exc)
+    return {
+        cid: _emojis_campeoes[nome_emoji_campeao(cid)]
+        for cid in ids if nome_emoji_campeao(cid) in _emojis_campeoes
+    }
 
 
 async def resumo_partida_lol(match_id: str) -> dict[str, Any] | None:
@@ -1409,31 +1472,42 @@ def _melhor(grupos: list[dict[str, Any]]) -> dict[str, Any]:
     return max(candidatos, key=lambda g: (g["v"] / g["j"], g["j"]))
 
 
+def ids_campeoes_estatisticas(dados: dict[str, Any]) -> set[int]:
+    """Campeões que podem aparecer no texto de estatísticas de um jogador."""
+    ids = {j["campeao_id"] for j in dados["jogos"]} | set(dados["maestria"])
+    if dados.get("recente"):
+        ids.add(dados["recente"]["campeao_id"])
+    return ids
+
+
 def texto_estatisticas(
-    conta: dict[str, Any], dados: dict[str, Any], nomes: dict[int, str]
+    conta: dict[str, Any], dados: dict[str, Any], nomes: dict[int, str],
+    icones: dict[int, str] | None = None,
 ) -> str:
+    icones = icones or {}
+
+    def campeao(cid: int, reserva: str = "") -> str:
+        # Mostra o ícone do campeão; se não houver ícone, mostra o nome.
+        return icones.get(cid) or nomes.get(cid) or reserva or f"Campeão {cid}"
+
     linhas = [
         f"🔗 {discord.utils.escape_markdown(conta.get('riot_id', ''))} • "
         f"{conta.get('elo') or 'Sem ranque'}"
     ]
     recente = dados.get("recente")
     if recente:
-        nome_recente = (
-            nomes.get(recente["campeao_id"]) or recente["campeao"]
-            or f"Campeão {recente['campeao_id']}"
-        )
+        nome_recente = campeao(recente["campeao_id"], recente["campeao"])
         detalhes = [NOMES_FILAS_LOL.get(recente["fila"], "Outro modo")]
         if recente["rota"] in NOMES_ROTA and recente["fila"] in FILAS_SUMMONERS_RIFT:
             detalhes.append(NOMES_ROTA[recente["rota"]])
         detalhes.append("Vitória" if recente["vitoria"] else "Derrota")
         quando = f" <t:{recente['fim']}:R>" if recente.get("fim") else ""
         linhas.append(
-            f"🕹️ Último campeão jogado: **{nome_recente}** ({' • '.join(detalhes)}){quando}"
+            f"🕹️ Último campeão jogado: {nome_recente} ({' • '.join(detalhes)}){quando}"
         )
     if dados["maestria"]:
         linhas.append(
-            "⭐ Maior maestria: "
-            + ", ".join(nomes.get(cid, f"Campeão {cid}") for cid in dados["maestria"])
+            "⭐ Maior maestria: " + " ".join(campeao(cid) for cid in dados["maestria"])
         )
     jogos = dados["jogos"]
     if not jogos:
@@ -1443,10 +1517,10 @@ def texto_estatisticas(
     por_campeao: dict[int, dict[str, Any]] = {}
     por_rota: dict[str, dict[str, Any]] = {}
     for jogo in jogos:
-        nome = nomes.get(jogo["campeao_id"]) or jogo["campeao"] or f"Campeão {jogo['campeao_id']}"
-        campeao = por_campeao.setdefault(jogo["campeao_id"], {"nome": nome, "j": 0, "v": 0})
-        campeao["j"] += 1
-        campeao["v"] += int(jogo["vitoria"])
+        nome = campeao(jogo["campeao_id"], jogo["campeao"])
+        grupo = por_campeao.setdefault(jogo["campeao_id"], {"nome": nome, "j": 0, "v": 0})
+        grupo["j"] += 1
+        grupo["v"] += int(jogo["vitoria"])
         if jogo["rota"] in NOMES_ROTA:
             rota = por_rota.setdefault(
                 jogo["rota"], {"nome": NOMES_ROTA[jogo["rota"]], "j": 0, "v": 0}
@@ -1465,7 +1539,7 @@ def texto_estatisticas(
     melhor = _melhor(campeoes)
     if melhor["v"]:
         linhas.append(
-            f"🏆 Melhor campeão: **{melhor['nome']}** — {melhor['v']}V {melhor['j'] - melhor['v']}D "
+            f"🏆 Melhor campeão: {melhor['nome']} — {melhor['v']}V {melhor['j'] - melhor['v']}D "
             f"({_porcentagem(melhor['v'], melhor['j'])}%)"
         )
     else:
@@ -1615,12 +1689,13 @@ async def estatisticas(
                     inline=False,
                 )
                 continue
+            icones = await icones_campeoes(ids_campeoes_estatisticas(dados))
             embed.add_field(
-                name=nome_membro, value=texto_estatisticas(conta, dados, nomes), inline=False
+                name=nome_membro, value=texto_estatisticas(conta, dados, nomes, icones),
+                inline=False,
             )
         embed.set_footer(
-            text=f"Últimas {quantidade} partidas de Summoner's Rift (normal e ranqueada).\n"
-            + AVISO_RIOT
+            text=f"Últimas {quantidade} partidas de Summoner's Rift (normal e ranqueada)."
         )
         await inter.followup.send(embed=embed, ephemeral=True)
 
