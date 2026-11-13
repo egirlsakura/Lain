@@ -8,9 +8,11 @@ import logging
 import os
 import random
 import re
+import time
+from collections import deque
 from pathlib import Path
 from typing import Any, Optional
-from urllib.parse import urlsplit, unquote
+from urllib.parse import urlsplit, unquote, quote
 import ipaddress
 
 import aiohttp
@@ -1011,6 +1013,618 @@ async def partida_status(interaction: discord.Interaction) -> None:
 
 
 
+# ======================= CONTA RIOT (API) =======================
+# /link liga o Discord ao Riot ID. O elo oficial (Solo/Duo) aparece no painel da fila.
+# O elo é só informativo: o sorteio dos times continua totalmente aleatório.
+RIOT_API_KEY = os.getenv("RIOT_API_KEY", "").strip()
+RIOT_REGIAO = "americas"  # Account-V1: contas do Brasil ficam na região americas.
+RIOT_PLATAFORMA = (os.getenv("RIOT_PLATAFORMA", "br1").strip().lower() or "br1")
+ARQUIVO_CONTAS_RIOT = Path("/data/contas_riot.json")
+ELO_VALIDADE_SEGUNDOS = 30 * 60  # Reconsulta o elo no máximo a cada 30 minutos.
+# Aviso exigido pela Riot para produtos que usam a API.
+AVISO_RIOT = (
+    "Este bot não é endossado pela Riot Games e não reflete as opiniões da Riot Games "
+    "ou de qualquer pessoa oficialmente envolvida na produção ou gestão das propriedades "
+    "da Riot Games. Riot Games e todas as propriedades associadas são marcas comerciais "
+    "ou marcas registradas da Riot Games, Inc."
+)
+NOMES_TIER = {
+    "IRON": "Ferro",
+    "BRONZE": "Bronze",
+    "SILVER": "Prata",
+    "GOLD": "Ouro",
+    "PLATINUM": "Platina",
+    "EMERALD": "Esmeralda",
+    "DIAMOND": "Diamante",
+    "MASTER": "Mestre",
+    "GRANDMASTER": "Grão-Mestre",
+    "CHALLENGER": "Desafiante",
+}
+
+
+def carregar_contas_riot() -> dict[str, dict[str, Any]]:
+    if not ARQUIVO_CONTAS_RIOT.exists():
+        return {}
+    try:
+        dados = json.loads(ARQUIVO_CONTAS_RIOT.read_text(encoding="utf-8"))
+        if not isinstance(dados, dict):
+            raise ValueError("A raiz deve ser um objeto JSON.")
+        return dados
+    except (json.JSONDecodeError, ValueError, OSError) as exc:
+        raise SystemExit(f"Erro ao ler contas_riot.json: {exc}") from exc
+
+
+contas_riot = carregar_contas_riot()
+trava_contas_riot = asyncio.Lock()
+
+
+def salvar_contas_riot() -> None:
+    ARQUIVO_CONTAS_RIOT.parent.mkdir(parents=True, exist_ok=True)
+    temporario = ARQUIVO_CONTAS_RIOT.with_suffix(".json.tmp")
+    temporario.write_text(
+        json.dumps(contas_riot, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    temporario.replace(ARQUIVO_CONTAS_RIOT)
+
+
+class ErroRiot(Exception):
+    def __init__(self, status: int, mensagem: str) -> None:
+        super().__init__(mensagem)
+        self.status = status
+
+
+# Limites da chave pessoal: 20 por segundo e 100 a cada 2 minutos.
+# Usamos valores um pouco menores para nunca estourar o limite.
+LIMITES_RIOT = ((18, 1.0), (95, 120.0))
+_chamadas_riot: deque[float] = deque()
+_trava_limite_riot = asyncio.Lock()
+
+
+async def aguardar_limite_riot() -> None:
+    """Espera, se preciso, até poder fazer mais uma consulta sem passar do limite."""
+    async with _trava_limite_riot:
+        while True:
+            agora = time.monotonic()
+            while _chamadas_riot and agora - _chamadas_riot[0] >= 120.0:
+                _chamadas_riot.popleft()
+            espera = 0.0
+            for maximo, janela in LIMITES_RIOT:
+                recentes = [t for t in _chamadas_riot if agora - t < janela]
+                if len(recentes) >= maximo:
+                    espera = max(espera, janela - (agora - recentes[-maximo]) + 0.05)
+            if espera <= 0:
+                _chamadas_riot.append(agora)
+                return
+            await asyncio.sleep(espera)
+
+
+async def chamar_riot(url: str) -> Any:
+    """Faz uma consulta à API da Riot. A chave vai só no cabeçalho, nunca na URL."""
+    if not RIOT_API_KEY:
+        raise ErroRiot(0, "A API da Riot não está configurada (RIOT_API_KEY).")
+    await aguardar_limite_riot()
+    timeout = aiohttp.ClientTimeout(total=8, connect=4)
+    async with aiohttp.ClientSession(timeout=timeout) as sessao:
+        async with sessao.get(url, headers={"X-Riot-Token": RIOT_API_KEY}) as resposta:
+            if resposta.status == 200:
+                return await resposta.json()
+            if resposta.status in (400, 404):
+                raise ErroRiot(
+                    resposta.status,
+                    "Riot ID não encontrado. Confira o nick e a tag (exemplo: Nick#BR1).",
+                )
+            if resposta.status in (401, 403):
+                raise ErroRiot(
+                    resposta.status,
+                    "A chave da API da Riot é inválida ou expirou. Confira RIOT_API_KEY.",
+                )
+            if resposta.status == 429:
+                raise ErroRiot(
+                    resposta.status,
+                    "Muitas consultas à Riot agora. Tente de novo em alguns minutos.",
+                )
+            raise ErroRiot(resposta.status, f"A Riot respondeu com erro {resposta.status}.")
+
+
+async def buscar_conta_riot(nome: str, tag: str) -> dict[str, Any]:
+    dados = await chamar_riot(
+        f"https://{RIOT_REGIAO}.api.riotgames.com/riot/account/v1/accounts/by-riot-id/"
+        f"{quote(nome, safe='')}/{quote(tag, safe='')}"
+    )
+    if not isinstance(dados, dict) or not dados.get("puuid"):
+        raise ErroRiot(0, "A Riot devolveu uma resposta inesperada.")
+    return dados
+
+
+def formatar_elo(entradas: Any) -> str:
+    """Mostra apenas a ranqueada Solo/Duo oficial."""
+    solo = None
+    if isinstance(entradas, list):
+        solo = next(
+            (e for e in entradas if isinstance(e, dict)
+             and e.get("queueType") == "RANKED_SOLO_5x5"),
+            None,
+        )
+    if not solo:
+        return "Sem ranque"
+    tier = str(solo.get("tier", ""))
+    nome = NOMES_TIER.get(tier, tier.title())
+    pdl = solo.get("leaguePoints", 0)
+    if tier in ("MASTER", "GRANDMASTER", "CHALLENGER"):
+        return f"{nome} ({pdl} PDL)"
+    return f"{nome} {solo.get('rank', '')} ({pdl} PDL)"
+
+
+async def buscar_elo(puuid: str) -> str:
+    dados = await chamar_riot(
+        f"https://{RIOT_PLATAFORMA}.api.riotgames.com/lol/league/v4/entries/by-puuid/"
+        f"{quote(puuid, safe='')}"
+    )
+    return formatar_elo(dados)
+
+
+async def atualizar_elo_se_preciso(usuario_id: int, limite: float = 2.0) -> None:
+    """Atualiza o elo salvo se estiver antigo. Em caso de falha, mantém o anterior."""
+    conta = contas_riot.get(str(usuario_id))
+    if not conta or not RIOT_API_KEY:
+        return
+    if time.time() - float(conta.get("elo_em", 0)) < ELO_VALIDADE_SEGUNDOS:
+        return
+    try:
+        elo = await asyncio.wait_for(buscar_elo(conta["puuid"]), timeout=limite)
+    except (ErroRiot, aiohttp.ClientError, asyncio.TimeoutError, ValueError, KeyError) as exc:
+        log.warning("Não consegui atualizar o elo de %s: %s", usuario_id, exc)
+        return
+    async with trava_contas_riot:
+        conta["elo"] = elo
+        conta["elo_em"] = time.time()
+        try:
+            salvar_contas_riot()
+        except OSError as exc:
+            log.warning("Não consegui salvar contas_riot.json: %s", exc)
+
+
+def texto_elo(usuario_id: int) -> str:
+    """Trecho exibido ao lado do jogador no painel da fila."""
+    conta = contas_riot.get(str(usuario_id))
+    if not conta or not conta.get("elo"):
+        return ""
+    return f" • {conta['elo']}"
+
+
+@bot.tree.command(
+    name="link", description="Vincula sua conta do League of Legends (Riot ID) ao Discord"
+)
+@app_commands.describe(riot_id="Seu Riot ID no formato Nick#TAG (exemplo: Nick#BR1)")
+async def link(inter: discord.Interaction, riot_id: str) -> None:
+    if not RIOT_API_KEY:
+        await inter.response.send_message(
+            "⚠️ A API da Riot ainda não foi configurada no bot (RIOT_API_KEY).",
+            ephemeral=True,
+        )
+        return
+    nome, separador, tag = riot_id.strip().rpartition("#")
+    nome, tag = nome.strip(), tag.strip()
+    if not separador or not 3 <= len(nome) <= 16 or not 2 <= len(tag) <= 5:
+        await inter.response.send_message(
+            "⚠️ Use o formato **Nick#TAG**. Exemplo: `/link Nick#BR1`", ephemeral=True
+        )
+        return
+
+    await inter.response.defer(ephemeral=True, thinking=True)
+    try:
+        conta = await buscar_conta_riot(nome, tag)
+        elo = await buscar_elo(conta["puuid"])
+    except ErroRiot as exc:
+        await inter.followup.send(f"⚠️ {exc}", ephemeral=True)
+        return
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, KeyError) as exc:
+        log.warning("Falha ao consultar a Riot no /link: %s", exc)
+        await inter.followup.send(
+            "⚠️ Não consegui falar com a Riot agora. Tente de novo daqui a pouco.",
+            ephemeral=True,
+        )
+        return
+
+    riot_nome = f"{conta.get('gameName') or nome}#{conta.get('tagLine') or tag}"
+    chave = str(inter.user.id)
+    async with trava_contas_riot:
+        anterior = contas_riot.get(chave)
+        contas_riot[chave] = {
+            "puuid": conta["puuid"],
+            "riot_id": riot_nome,
+            "elo": elo,
+            "elo_em": time.time(),
+        }
+        try:
+            salvar_contas_riot()
+        except OSError as exc:
+            if anterior is None:
+                contas_riot.pop(chave, None)
+            else:
+                contas_riot[chave] = anterior
+            log.exception("Não consegui salvar a conta Riot: %s", exc)
+            await inter.followup.send(
+                "⚠️ Não consegui salvar o vínculo em /data/contas_riot.json.", ephemeral=True
+            )
+            return
+
+    # Atualiza os painéis de fila abertos em que o jogador já está inscrito.
+    if inter.guild is not None:
+        async with trava_servidor(inter.guild.id):
+            for _chave, fila in filas_abertas(inter.guild.id):
+                if inter.user.id in fila.get("inscritos", []):
+                    await atualizar_mensagem_fila(inter.guild, fila)
+
+    await inter.followup.send(
+        f"✅ Conta vinculada: **{discord.utils.escape_markdown(riot_nome)}**\n"
+        f"🏅 Elo (Solo/Duo): **{elo}**\n"
+        "Seu elo vai aparecer ao seu lado no painel da fila. "
+        "Para trocar de conta, use `/link` de novo.\n\n"
+        f"-# {AVISO_RIOT}",
+        ephemeral=True,
+    )
+
+
+# ======================= ESTATÍSTICAS DOS JOGADORES =======================
+# /estatisticas analisa as partidas recentes de Summoner's Rift (normal e ranqueada)
+# de quem usou /link: campeões mais jogados, taxa de vitória e rotas.
+PARTIDAS_ANALISADAS = 15  # Por jogador. Um time de 5 cabe no limite de 2 minutos.
+FILAS_SUMMONERS_RIFT = {400, 420, 430, 440, 490}  # Normal, Solo/Duo, Flex, Escolha Rápida.
+ESTATISTICAS_VALIDADE_SEGUNDOS = 10 * 60
+NOMES_ROTA = {
+    "TOP": "Topo",
+    "JUNGLE": "Selva",
+    "MIDDLE": "Meio",
+    "BOTTOM": "Atirador",
+    "UTILITY": "Suporte",
+}
+NOMES_FILAS_LOL = {
+    400: "Normal Alternada",
+    420: "Ranqueada Solo/Duo",
+    430: "Normal às Cegas",
+    440: "Ranqueada Flex",
+    450: "ARAM",
+    490: "Escolha Rápida",
+    1700: "Arena",
+}
+_nomes_campeoes: dict[int, str] = {}
+# Partidas do LoL não mudam depois de terminar; guardamos um resumo para não reconsultar.
+_cache_partidas_lol: dict[str, dict[str, Any] | None] = {}
+_cache_estatisticas: dict[str, tuple[float, dict[str, Any]]] = {}
+
+
+async def nomes_campeoes() -> dict[int, str]:
+    """Nomes dos campeões em português, pelo Data Dragon público da Riot."""
+    if _nomes_campeoes:
+        return _nomes_campeoes
+    timeout = aiohttp.ClientTimeout(total=10, connect=4)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as sessao:
+            async with sessao.get("https://ddragon.leagueoflegends.com/api/versions.json") as r:
+                versao = (await r.json())[0]
+            async with sessao.get(
+                f"https://ddragon.leagueoflegends.com/cdn/{versao}/data/pt_BR/champion.json"
+            ) as r:
+                dados = await r.json()
+        for campeao in dados["data"].values():
+            _nomes_campeoes[int(campeao["key"])] = campeao["name"]
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, KeyError, IndexError) as exc:
+        log.warning("Não consegui carregar os nomes dos campeões: %s", exc)
+    return _nomes_campeoes
+
+
+async def resumo_partida_lol(match_id: str) -> dict[str, Any] | None:
+    """Resumo de uma partida: modo, horário e campeão/rota/resultado de cada participante."""
+    if match_id in _cache_partidas_lol:
+        return _cache_partidas_lol[match_id]
+    dados = await chamar_riot(
+        f"https://{RIOT_REGIAO}.api.riotgames.com/lol/match/v5/matches/{quote(match_id, safe='')}"
+    )
+    info = dados.get("info", {}) if isinstance(dados, dict) else {}
+    resumo = None
+    # Partidas encerradas por remake (menos de 5 minutos) são ignoradas.
+    if info.get("participants") and info.get("gameDuration", 0) >= 300:
+        fila = int(info.get("queueId", 0))
+        resumo = {
+            "fila": fila,
+            # Só Summoner's Rift (normal e ranqueada) entra nas estatísticas.
+            "summoners_rift": fila in FILAS_SUMMONERS_RIFT,
+            "fim": int(info.get("gameEndTimestamp") or 0) // 1000,
+            "participantes": [
+                {
+                    "puuid": p.get("puuid"),
+                    "campeao_id": int(p.get("championId", 0)),
+                    "campeao": p.get("championName") or "",
+                    "rota": p.get("teamPosition") or "",
+                    "vitoria": bool(p.get("win")),
+                }
+                for p in info.get("participants", [])
+            ],
+        }
+    _cache_partidas_lol[match_id] = resumo
+    while len(_cache_partidas_lol) > 3000:
+        _cache_partidas_lol.pop(next(iter(_cache_partidas_lol)))
+    return resumo
+
+
+async def dados_estatisticas(puuid: str, quantidade: int = PARTIDAS_ANALISADAS) -> dict[str, Any]:
+    """Partidas recentes, última partida jogada e campeões de maior maestria."""
+    chave_cache = f"{puuid}:{quantidade}"
+    guardado = _cache_estatisticas.get(chave_cache)
+    if guardado and time.time() - guardado[0] < ESTATISTICAS_VALIDADE_SEGUNDOS:
+        return guardado[1]
+    ids = await chamar_riot(
+        f"https://{RIOT_REGIAO}.api.riotgames.com/lol/match/v5/matches/by-puuid/"
+        f"{quote(puuid, safe='')}/ids?start=0&count={quantidade}"
+    )
+    try:
+        maestria = await chamar_riot(
+            f"https://{RIOT_PLATAFORMA}.api.riotgames.com/lol/champion-mastery/v4/"
+            f"champion-masteries/by-puuid/{quote(puuid, safe='')}/top?count=3"
+        )
+    except ErroRiot as exc:
+        log.warning("Não consegui buscar a maestria: %s", exc)
+        maestria = []
+    jogos = []
+    recente = None
+    # A Riot devolve os IDs da partida mais nova para a mais antiga.
+    for match_id in ids if isinstance(ids, list) else []:
+        try:
+            resumo = await resumo_partida_lol(str(match_id))
+        except ErroRiot as exc:
+            if exc.status in (401, 403, 429):
+                raise
+            continue
+        if not resumo:
+            continue
+        participante = next(
+            (p for p in resumo["participantes"] if p["puuid"] == puuid), None
+        )
+        if not participante:
+            continue
+        if recente is None:
+            # Última partida jogada, em qualquer modo (ARAM, Arena, etc.).
+            recente = {**participante, "fila": resumo["fila"], "fim": resumo["fim"]}
+        if resumo["summoners_rift"]:
+            jogos.append(participante)
+    dados = {
+        "jogos": jogos,
+        "recente": recente,
+        "maestria": [
+            int(m.get("championId", 0)) for m in (maestria if isinstance(maestria, list) else [])
+        ],
+    }
+    _cache_estatisticas[chave_cache] = (time.time(), dados)
+    return dados
+
+
+def _porcentagem(vitorias: int, jogos: int) -> int:
+    return round(100 * vitorias / jogos) if jogos else 0
+
+
+def _melhor(grupos: list[dict[str, Any]]) -> dict[str, Any]:
+    """Maior taxa de vitória, exigindo ao menos 2 jogos quando possível."""
+    candidatos = [g for g in grupos if g["j"] >= 2] or grupos
+    return max(candidatos, key=lambda g: (g["v"] / g["j"], g["j"]))
+
+
+def texto_estatisticas(
+    conta: dict[str, Any], dados: dict[str, Any], nomes: dict[int, str]
+) -> str:
+    linhas = [
+        f"🔗 {discord.utils.escape_markdown(conta.get('riot_id', ''))} • "
+        f"{conta.get('elo') or 'Sem ranque'}"
+    ]
+    recente = dados.get("recente")
+    if recente:
+        nome_recente = (
+            nomes.get(recente["campeao_id"]) or recente["campeao"]
+            or f"Campeão {recente['campeao_id']}"
+        )
+        detalhes = [NOMES_FILAS_LOL.get(recente["fila"], "Outro modo")]
+        if recente["rota"] in NOMES_ROTA and recente["fila"] in FILAS_SUMMONERS_RIFT:
+            detalhes.append(NOMES_ROTA[recente["rota"]])
+        detalhes.append("Vitória" if recente["vitoria"] else "Derrota")
+        quando = f" <t:{recente['fim']}:R>" if recente.get("fim") else ""
+        linhas.append(
+            f"🕹️ Último campeão jogado: **{nome_recente}** ({' • '.join(detalhes)}){quando}"
+        )
+    if dados["maestria"]:
+        linhas.append(
+            "⭐ Maior maestria: "
+            + ", ".join(nomes.get(cid, f"Campeão {cid}") for cid in dados["maestria"])
+        )
+    jogos = dados["jogos"]
+    if not jogos:
+        linhas.append("ℹ️ Nenhuma partida recente de Summoner's Rift encontrada.")
+        return "\n".join(linhas)
+
+    por_campeao: dict[int, dict[str, Any]] = {}
+    por_rota: dict[str, dict[str, Any]] = {}
+    for jogo in jogos:
+        nome = nomes.get(jogo["campeao_id"]) or jogo["campeao"] or f"Campeão {jogo['campeao_id']}"
+        campeao = por_campeao.setdefault(jogo["campeao_id"], {"nome": nome, "j": 0, "v": 0})
+        campeao["j"] += 1
+        campeao["v"] += int(jogo["vitoria"])
+        if jogo["rota"] in NOMES_ROTA:
+            rota = por_rota.setdefault(
+                jogo["rota"], {"nome": NOMES_ROTA[jogo["rota"]], "j": 0, "v": 0}
+            )
+            rota["j"] += 1
+            rota["v"] += int(jogo["vitoria"])
+
+    campeoes = list(por_campeao.values())
+    mais_jogados = sorted(campeoes, key=lambda c: (-c["j"], -c["v"]))[:3]
+    linhas.append(
+        f"📊 Mais jogados ({len(jogos)} partidas): "
+        + " • ".join(
+            f"{c['nome']} {c['j']}j ({_porcentagem(c['v'], c['j'])}% vit.)" for c in mais_jogados
+        )
+    )
+    melhor = _melhor(campeoes)
+    if melhor["v"]:
+        linhas.append(
+            f"🏆 Melhor campeão: **{melhor['nome']}** — {melhor['v']}V {melhor['j'] - melhor['v']}D "
+            f"({_porcentagem(melhor['v'], melhor['j'])}%)"
+        )
+    else:
+        linhas.append("🏆 Melhor campeão: ainda sem vitórias nas partidas analisadas")
+    mais_derrotas = max(campeoes, key=lambda c: (c["j"] - c["v"], c["j"]))
+    derrotas = mais_derrotas["j"] - mais_derrotas["v"]
+    if derrotas:
+        linhas.append(
+            f"📉 Mais derrotas com: {mais_derrotas['nome']} — {derrotas} derrota(s) "
+            f"em {mais_derrotas['j']} jogo(s)"
+        )
+    else:
+        linhas.append("📉 Mais derrotas com: nenhuma derrota nas partidas analisadas")
+
+    if por_rota:
+        rotas = list(por_rota.values())
+        mais_jogada = max(rotas, key=lambda r: (r["j"], r["v"]))
+        mais_vitorias = max(rotas, key=lambda r: (r["v"], -r["j"]))
+        melhor_rota = _melhor(rotas)
+        linhas.append(f"🧭 Rota mais jogada: {mais_jogada['nome']} ({mais_jogada['j']} jogos)")
+        linhas.append(
+            f"✅ Rota com mais vitórias: {mais_vitorias['nome']} ({mais_vitorias['v']} vitórias)"
+        )
+        linhas.append(
+            f"🎯 Melhor rota: **{melhor_rota['nome']}** — "
+            f"{_porcentagem(melhor_rota['v'], melhor_rota['j'])}% de vitórias "
+            f"em {melhor_rota['j']} jogo(s)"
+        )
+    texto = "\n".join(linhas)
+    return texto if len(texto) <= 1024 else texto[:1020] + "…"
+
+
+@bot.tree.command(
+    name="estatisticas",
+    description="Campeões mais jogados, taxa de vitória e rotas de um time ou jogador",
+)
+@app_commands.describe(
+    equipe="Um time da partida em andamento, ou Todos os times de uma vez",
+    jogador="Ver apenas um jogador (se vazio e sem equipe, mostra você)",
+    partida="Número da partida, se houver mais de uma em andamento",
+)
+@app_commands.choices(
+    equipe=[
+        app_commands.Choice(name="👥 Todos os times", value="todos"),
+        *[
+            app_commands.Choice(name=f"{emoji} {nome}", value=chave)
+            for chave, emoji, nome in EQUIPES
+        ],
+    ]
+)
+@app_commands.guild_only()
+async def estatisticas(
+    inter: discord.Interaction,
+    equipe: app_commands.Choice[str] | None = None,
+    jogador: discord.Member | None = None,
+    partida: Optional[app_commands.Range[int, 1, 99]] = None,
+) -> None:
+    guild = inter.guild
+    if guild is None:
+        await inter.response.send_message("Use este comando no servidor.", ephemeral=True)
+        return
+    if not RIOT_API_KEY:
+        await inter.response.send_message(
+            "⚠️ A API da Riot ainda não foi configurada no bot (RIOT_API_KEY).",
+            ephemeral=True,
+        )
+        return
+
+    # Cada grupo vira um embed: (título, IDs dos jogadores).
+    grupos: list[tuple[str, list[int]]] = []
+    if equipe is None:
+        grupos.append((
+            f"📊 Estatísticas de {(jogador or inter.user).display_name}",
+            [(jogador or inter.user).id],
+        ))
+    else:
+        ativas = partidas_do_servidor(guild.id)
+        escolhida = None
+        if partida is not None:
+            escolhida = next((p for _c, p in ativas if p.get("numero") == partida), None)
+        else:
+            # Usa a partida em que quem pediu está jogando ou assistindo.
+            uid = str(inter.user.id)
+            escolhida = next(
+                (p for _c, p in ativas
+                 if uid in p.get("participantes", {}) or uid in p.get("espectadores", {})),
+                None,
+            )
+            if escolhida is None and len(ativas) == 1:
+                escolhida = ativas[0][1]
+        if escolhida is None:
+            texto = (
+                "ℹ️ Não há partida em andamento." if not ativas else
+                "⚠️ Há mais de uma partida em andamento. Informe o número em `partida`."
+                if partida is None else f"⚠️ Não encontrei a Partida {partida}."
+            )
+            await inter.response.send_message(texto, ephemeral=True)
+            return
+        numero = escolhida.get("numero", 1)
+        participantes = escolhida.get("participantes", {})
+        for chave, emoji, nome in EQUIPES:
+            if equipe.value not in ("todos", chave):
+                continue
+            ids_time = [
+                int(uid) for uid, dados in participantes.items() if dados.get("time") == chave
+            ]
+            if ids_time:
+                grupos.append((f"📊 Partida {numero} | {emoji} Time {nome}", ids_time))
+        if not grupos:
+            await inter.response.send_message(
+                f"⚠️ O time {equipe.name} não está na Partida {numero}.", ephemeral=True
+            )
+            return
+
+    await inter.response.defer(ephemeral=True, thinking=True)
+    nomes = await nomes_campeoes()
+    # Com muitos jogadores, analisa menos partidas de cada um para não demorar demais.
+    total_jogadores = sum(len(ids) for _t, ids in grupos)
+    quantidade = PARTIDAS_ANALISADAS if total_jogadores <= 10 else 8
+    chave_invalida = False
+    # Cada time é enviado assim que fica pronto, sem esperar os outros.
+    for titulo, ids in grupos:
+        embed = discord.Embed(title=titulo, color=0x5865F2)
+        for uid in ids[:6]:
+            membro = guild.get_member(uid)
+            nome_membro = membro.display_name if membro else f"Jogador {uid}"
+            conta = contas_riot.get(str(uid))
+            if not conta:
+                embed.add_field(
+                    name=nome_membro, value="🔗 Ainda não vinculou a conta (`/link Nick#TAG`).",
+                    inline=False,
+                )
+                continue
+            if chave_invalida:
+                embed.add_field(name=nome_membro, value="⚠️ Consulta interrompida.", inline=False)
+                continue
+            try:
+                dados = await dados_estatisticas(conta["puuid"], quantidade)
+            except ErroRiot as exc:
+                embed.add_field(name=nome_membro, value=f"⚠️ {exc}", inline=False)
+                chave_invalida = exc.status in (401, 403)
+                continue
+            except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, KeyError) as exc:
+                log.warning("Falha nas estatísticas de %s: %s", uid, exc)
+                embed.add_field(
+                    name=nome_membro, value="⚠️ Não consegui falar com a Riot agora.",
+                    inline=False,
+                )
+                continue
+            embed.add_field(
+                name=nome_membro, value=texto_estatisticas(conta, dados, nomes), inline=False
+            )
+        embed.set_footer(
+            text=f"Últimas {quantidade} partidas de Summoner's Rift (normal e ranqueada).\n"
+            + AVISO_RIOT
+        )
+        await inter.followup.send(embed=embed, ephemeral=True)
+
+
 # ======================= FILA DE JOGADORES =======================
 # /queue cria uma mensagem pública. Os inscritos ficam na mesma sala de espera.
 # Inscrições (colunas) não são os times definitivos: o sorteio ocorre em Iniciar.
@@ -1095,7 +1709,8 @@ def montar_embed_fila(fila: dict[str, Any]) -> discord.Embed:
             if indice >= capacidade:
                 linhas.append("▫️ Sem vaga")
             elif indice < len(inscritos):
-                linhas.append(f"<@{inscritos[indice]}>")
+                # Elo apenas informativo (quem usou /link); não afeta o sorteio.
+                linhas.append(f"<@{inscritos[indice]}>{texto_elo(inscritos[indice])}")
             else:
                 linhas.append("⬜ Livre")
         embed.add_field(name=f"{emoji} Coluna {nome}", value="\n".join(linhas), inline=True)
@@ -1184,6 +1799,8 @@ class FilaView(discord.ui.View):
         if inter.guild is None or not isinstance(inter.user, discord.Member):
             await inter.response.send_message("Use a fila dentro de um servidor.", ephemeral=True)
             return
+        # Atualiza o elo salvo (se estiver antigo) antes de redesenhar o painel.
+        await atualizar_elo_se_preciso(inter.user.id)
         async with trava_servidor(inter.guild.id):
             fila = valida_fila_interacao(inter)
             if fila is None:
