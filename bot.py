@@ -76,6 +76,16 @@ def carregar_partidas() -> dict[str, dict[str, Any]]:
 
 
 partidas = carregar_partidas()
+# Várias partidas por servidor: cada uma guarda o servidor e um número próprio.
+# Partidas do formato antigo (chave = ID do servidor) recebem esses dados aqui.
+_partidas_convertidas = False
+for _chave_partida, _partida in partidas.items():
+    if "guild_id" not in _partida:
+        _partida["guild_id"] = int(_chave_partida)
+        _partidas_convertidas = True
+    if "numero" not in _partida:
+        _partida["numero"] = 1
+        _partidas_convertidas = True
 
 
 def carregar_filas() -> dict[str, dict[str, Any]]:
@@ -85,7 +95,19 @@ def carregar_filas() -> dict[str, dict[str, Any]]:
         dados = json.loads(ARQUIVO_FILAS.read_text(encoding="utf-8"))
         if not isinstance(dados, dict):
             raise ValueError("A raiz deve ser um objeto JSON.")
-        return dados
+        # Cada fila é guardada pelo ID da sua mensagem, permitindo várias por servidor.
+        # Formato antigo (uma fila por servidor, chave = ID do servidor) é convertido.
+        convertidas: dict[str, dict[str, Any]] = {}
+        for chave, fila in dados.items():
+            if not isinstance(fila, dict):
+                continue
+            if "guild_id" not in fila:
+                fila["guild_id"] = int(chave)
+                if not fila.get("message_id"):
+                    continue
+                chave = str(fila["message_id"])
+            convertidas[chave] = fila
+        return convertidas
     except (json.JSONDecodeError, ValueError, OSError) as exc:
         raise SystemExit(f"Erro ao carregar filas.json: {exc}") from exc
 
@@ -299,16 +321,24 @@ def opcoes_imagem_edicao_fila(
 
 
 # Se reiniciou enquanto uma fila estava iniciando, a partida já está salva.
-for _gid, _fila in list(filas.items()):
+_filas_recuperadas = False
+for _chave_fila, _fila in list(filas.items()):
     if _fila.get("status") == "iniciando":
-        if _gid in partidas:
-            filas.pop(_gid, None)
+        _filas_recuperadas = True
+        # A partida criada por uma fila usa o mesmo ID da mensagem da fila.
+        if _chave_fila in partidas:
+            filas.pop(_chave_fila, None)
         else:
             _fila["status"] = "aberta"
+# Também regrava o arquivo se ele estava no formato antigo (uma fila por servidor).
+if ARQUIVO_FILAS.exists():
+    try:
+        _filas_recuperadas = _filas_recuperadas or set(filas) != set(
+            json.loads(ARQUIVO_FILAS.read_text(encoding="utf-8"))
+        )
+    except (OSError, ValueError):
+        pass
 # As alterações de recuperação são persistidas depois de definir salvar_filas().
-_filas_recuperadas = any(
-    fila.get("status") == "iniciando" for fila in carregar_filas().values()
-)
 travas: dict[int, asyncio.Lock] = {}
 
 
@@ -335,6 +365,43 @@ def salvar_partidas() -> None:
     temporario = ARQUIVO_PARTIDAS.with_suffix(".json.tmp")
     temporario.write_text(json.dumps(partidas, ensure_ascii=False, indent=2), encoding="utf-8")
     temporario.replace(ARQUIVO_PARTIDAS)
+
+
+if _partidas_convertidas:
+    salvar_partidas()
+
+
+def partidas_do_servidor(guild_id: int) -> list[tuple[str, dict[str, Any]]]:
+    """Partidas ativas do servidor, ordenadas pelo número da partida."""
+    ativas = [
+        (chave, partida) for chave, partida in partidas.items()
+        if partida.get("guild_id") == guild_id
+    ]
+    return sorted(ativas, key=lambda item: int(item[1].get("numero", 1)))
+
+
+def numero_livre_partida(guild_id: int) -> int:
+    """Menor número ainda não usado por uma partida ativa do servidor."""
+    usados = {int(p.get("numero", 1)) for _c, p in partidas_do_servidor(guild_id)}
+    numero = 1
+    while numero in usados:
+        numero += 1
+    return numero
+
+
+def descrever_partida(guild: discord.Guild, partida: dict[str, Any]) -> tuple[str, str]:
+    """Rótulo e descrição curtos para identificar a partida em menus."""
+    times = list((partida.get("canais") or {}).keys()) or ["vermelho", "azul"]
+    nomes = [nome for chave, _e, nome in EQUIPES if chave in times]
+    rotulo = (
+        f"Partida {partida.get('numero', 1)} | {len(partida.get('participantes', {}))} jogadores"
+        f" | {len(times)} times"
+    )
+    origem = buscar_voz(guild, partida.get("origem_id"))
+    descricao = (
+        f"Sala: {origem.name if origem else 'indisponível'} | " + " x ".join(nomes)
+    )
+    return rotulo[:100], descricao[:100]
 
 
 def buscar_voz(guild: discord.Guild, canal_id: int | None) -> discord.VoiceChannel | None:
@@ -469,7 +536,8 @@ class ClientePartidas(discord.Client):
         self._imagens_fila_recuperadas = True
         # Recupera também a imagem do painel da versão anterior, caso ainda
         # exista no Discord e ainda não tenha sido salva em /data.
-        for guild_id, fila in list(filas.items()):
+        for fila in list(filas.values()):
+            guild_id = fila.get("guild_id")
             if (not fila.get("imagem_nome") or not fila.get("message_id")
                     or str(guild_id) in imagens_fila):
                 continue
@@ -560,69 +628,137 @@ async def terminar_partida(interaction: discord.Interaction, vencedor: str | Non
 
     await interaction.response.defer(thinking=True)
     async with trava_servidor(guild.id):
-        chave = str(guild.id)
-        partida = partidas.get(chave)
-        if partida is None:
+        ativas = partidas_do_servidor(guild.id)
+        if not ativas:
             await interaction.followup.send("ℹ️ Não há partida ativa neste servidor.")
             return
-        anterior = partida.get("vencedor")
-        if anterior and vencedor and anterior != vencedor:
+        # Apenas uma partida ativa: finaliza/cancela direto, sem perguntar.
+        if len(ativas) == 1:
+            mensagem = await encerrar_partida(guild, ativas[0][0], vencedor)
             await interaction.followup.send(
-                f"⚠️ O vencedor já foi registrado como **{anterior.title()}**. "
-                "Não é possível alterar o resultado enquanto a partida está sendo finalizada."
+                mensagem, allowed_mentions=discord.AllowedMentions.none()
             )
             return
-        # Não aceita declarar um time que não participa desta partida.
-        chaves_ativas = set((partida.get("canais") or {}).keys()) or {"vermelho", "azul"}
-        if vencedor is not None and vencedor not in chaves_ativas:
-            await interaction.followup.send(
-                "⚠️ Esse time não participa desta partida. Selecione um vencedor válido."
+        aviso = (
+            f"\n⚠️ Mostrando as 25 primeiras de {len(ativas)} partidas."
+            if len(ativas) > 25 else ""
+        )
+        acao = "finalizar" if vencedor else "cancelar"
+        await interaction.followup.send(
+            f"🎮 Há **{len(ativas)} partidas em andamento**. "
+            f"Selecione qual deseja {acao}:{aviso}",
+            view=SeletorPartida(interaction.user.id, guild, vencedor),
+        )
+
+
+async def encerrar_partida(
+    guild: discord.Guild, chave_partida: str, vencedor: str | None
+) -> str:
+    """Finaliza ou cancela uma partida. Deve ser chamada com a trava do servidor."""
+    partida = partidas.get(chave_partida)
+    if partida is None or partida.get("guild_id") != guild.id:
+        return "ℹ️ Essa partida não está mais ativa."
+    numero = partida.get("numero", 1)
+    anterior = partida.get("vencedor")
+    if anterior and vencedor and anterior != vencedor:
+        return (
+            f"⚠️ O vencedor da Partida {numero} já foi registrado como **{anterior.title()}**. "
+            "Não é possível alterar o resultado enquanto a partida está sendo finalizada."
+        )
+    # Não aceita declarar um time que não participa desta partida.
+    chaves_ativas = set((partida.get("canais") or {}).keys()) or {"vermelho", "azul"}
+    if vencedor is not None and vencedor not in chaves_ativas:
+        return (
+            f"⚠️ Esse time não participa da Partida {numero}. Selecione um vencedor válido."
+        )
+    if vencedor and not anterior:
+        partida["vencedor"] = vencedor
+        salvar_partidas()
+
+    # Desativa o botão de espectador assim que a finalização começa.
+    canal_painel = guild.get_channel(partida.get("assistir_channel_id"))
+    if isinstance(canal_painel, discord.TextChannel) and partida.get("assistir_message_id"):
+        try:
+            painel = await canal_painel.fetch_message(partida["assistir_message_id"])
+            await painel.edit(view=None)
+        except (discord.Forbidden, discord.NotFound, discord.HTTPException) as exc:
+            log.warning("Não consegui desativar o botão Assistir: %s", exc)
+
+    devolvidos, problemas = await devolver_jogadores(guild, partida)
+    # Dá ao Discord um curto intervalo para atualizar os estados de voz.
+    await asyncio.sleep(1)
+    problemas.extend(await remover_estrutura(guild, partida))
+
+    # É seguro descartar o registro somente quando a estrutura foi removida.
+    categoria_restante = guild.get_channel(partida.get("categoria_id"))
+    canais_restantes = canal_times(guild, partida)
+    concluida = not categoria_restante and not canais_restantes
+    if concluida:
+        partidas.pop(chave_partida, None)
+        salvar_partidas()
+
+    resultado = partida.get("vencedor")
+    mensagem = f"🎮 **Partida {numero}**\n"
+    if resultado:
+        detalhes = next((f"{emoji} {nome.upper()}" for chave, emoji, nome in EQUIPES
+                          if chave == resultado), resultado.upper())
+        mensagem += f"🏆 **O TIME {detalhes} VENCEU!**\n"
+    else:
+        mensagem += "🛑 **Partida cancelada.**\n"
+    mensagem += f"↩️ Pessoas devolvidas ao canal original: **{devolvidos}**.\n"
+    if concluida:
+        mensagem += "🧹 Canais e categoria da partida removidos."
+    else:
+        mensagem += (
+            "⚠️ A estrutura foi mantida para proteger jogadores ou canais ainda presentes. "
+            "Use `/partida_finalizar` ou `/partida_cancelar` novamente depois de corrigir o problema."
+        )
+    if problemas:
+        mensagem += "\n**Pendências:** " + "; ".join(problemas[:5])
+    return mensagem
+
+
+class SeletorPartida(discord.ui.View):
+    """Menu para escolher qual partida em andamento será finalizada ou cancelada."""
+
+    def __init__(self, usuario_id: int, guild: discord.Guild, vencedor: str | None) -> None:
+        super().__init__(timeout=180)
+        self.usuario_id = usuario_id
+        self.guild_id = guild.id
+        self.vencedor = vencedor
+        opcoes = []
+        # O Discord aceita no máximo 25 opções em um menu.
+        for chave, partida in partidas_do_servidor(guild.id)[:25]:
+            rotulo, descricao = descrever_partida(guild, partida)
+            opcoes.append(discord.SelectOption(
+                label=rotulo, value=chave, description=descricao,
+                emoji="🏆" if vencedor else "🛑",
+            ))
+        self.menu = discord.ui.Select(
+            placeholder="Escolha a partida", min_values=1, max_values=1, options=opcoes,
+        )
+        self.menu.callback = self.escolher
+        self.add_item(self.menu)
+
+    async def interaction_check(self, inter: discord.Interaction) -> bool:
+        if inter.user.id != self.usuario_id or inter.guild_id != self.guild_id:
+            await inter.response.send_message(
+                "🚫 Somente quem abriu este menu pode usá-lo.", ephemeral=True
             )
+            return False
+        return True
+
+    async def escolher(self, inter: discord.Interaction) -> None:
+        if inter.guild is None or not autorizado(inter):
+            await inter.response.send_message("⛔ Sem permissão.", ephemeral=True)
             return
-        if vencedor and not anterior:
-            partida["vencedor"] = vencedor
-            salvar_partidas()
-
-        # Desativa o botão de espectador assim que a finalização começa.
-        canal_painel = guild.get_channel(partida.get("assistir_channel_id"))
-        if isinstance(canal_painel, discord.TextChannel) and partida.get("assistir_message_id"):
-            try:
-                painel = await canal_painel.fetch_message(partida["assistir_message_id"])
-                await painel.edit(view=None)
-            except (discord.Forbidden, discord.NotFound, discord.HTTPException) as exc:
-                log.warning("Não consegui desativar o botão Assistir: %s", exc)
-
-        devolvidos, problemas = await devolver_jogadores(guild, partida)
-        # Dá ao Discord um curto intervalo para atualizar os estados de voz.
-        await asyncio.sleep(1)
-        problemas.extend(await remover_estrutura(guild, partida))
-
-        # É seguro descartar o registro somente quando a estrutura foi removida.
-        categoria_restante = guild.get_channel(partida.get("categoria_id"))
-        canais_restantes = canal_times(guild, partida)
-        concluida = not categoria_restante and not canais_restantes
-        if concluida:
-            partidas.pop(chave, None)
-            salvar_partidas()
-
-        resultado = partida.get("vencedor")
-        if resultado:
-            detalhes = next((f"{emoji} {nome.upper()}" for chave, emoji, nome in EQUIPES
-                              if chave == resultado), resultado.upper())
-            mensagem = f"🏆 **O TIME {detalhes} VENCEU!**\n"
-        else:
-            mensagem = "🛑 **Partida cancelada.**\n"
-        mensagem += f"↩️ Pessoas devolvidas ao canal original: **{devolvidos}**.\n"
-        if concluida:
-            mensagem += "🧹 Canais e categoria da partida removidos."
-        else:
-            mensagem += (
-                "⚠️ A estrutura foi mantida para proteger jogadores ou canais ainda presentes. "
-                "Use `/partida_finalizar` ou `/partida_cancelar` novamente depois de corrigir o problema."
-            )
-        if problemas:
-            mensagem += "\n**Pendências:** " + "; ".join(problemas[:5])
-        await interaction.followup.send(mensagem, allowed_mentions=discord.AllowedMentions.none())
+        chave = self.menu.values[0]
+        await inter.response.defer()
+        async with trava_servidor(inter.guild.id):
+            mensagem = await encerrar_partida(inter.guild, chave, self.vencedor)
+        await inter.edit_original_response(
+            content=mensagem, view=None, allowed_mentions=discord.AllowedMentions.none()
+        )
 
 
 
@@ -687,12 +823,9 @@ async def partida_iniciar(
 
     await interaction.response.defer(thinking=True)
     async with trava_servidor(guild.id):
-        chave = str(guild.id)
-        if chave in partidas:
-            await interaction.followup.send(
-                "⚠️ Já existe uma partida neste servidor. Use `/partida_status` ou finalize a atual."
-            )
-            return
+        # Cada partida tem sua própria chave; várias podem rodar ao mesmo tempo.
+        chave = str(interaction.id)
+        numero = numero_livre_partida(guild.id)
         jogadores = [m for m in canal.members if not m.bot]
         if len(jogadores) < 2:
             await interaction.followup.send(
@@ -705,6 +838,8 @@ async def partida_iniciar(
         vermelhos, azuis = jogadores[:corte], jogadores[corte:]
 
         partida: dict[str, Any] = {
+            "guild_id": guild.id,
+            "numero": numero,
             "origem_id": canal.id,
             "categoria_id": None,
             "vermelho_id": None,
@@ -721,7 +856,9 @@ async def partida_iniciar(
         partidas[chave] = partida
         salvar_partidas()
         try:
-            categoria = await guild.create_category("🎮 PARTIDA EM ANDAMENTO", reason="Início da partida")
+            categoria = await guild.create_category(
+                f"🎮 PARTIDA {numero} EM ANDAMENTO", reason="Início da partida"
+            )
             partida["categoria_id"] = categoria.id
             salvar_partidas()
             canal_vermelho = await guild.create_voice_channel(
@@ -780,7 +917,7 @@ async def partida_iniciar(
             return
 
         embed = discord.Embed(
-            title="🎮 Partida iniciada!",
+            title=f"🎮 Partida {numero} iniciada!",
             description=(
                 f"Canal original: {canal.mention}\n"
                 f"Jogadores sorteados: **{len(jogadores)}** | Movidos: **{movimentados}**"
@@ -849,20 +986,27 @@ async def partida_status(interaction: discord.Interaction) -> None:
         )
         return
     async with trava_servidor(guild.id):
-        partida = partidas.get(str(guild.id))
-        if partida is None:
+        ativas = partidas_do_servidor(guild.id)
+        if not ativas:
             await interaction.response.send_message("ℹ️ Não existe partida ativa.", ephemeral=True)
             return
-        canais = canal_times(guild, partida)
-        linhas = [
-            "🎮 **Partida registrada**",
-            f"🎙️ Origem: <#{partida['origem_id']}>",
-            f"👥 Jogadores sorteados: {len(partida.get('participantes', {}))}",
-            f"🏆 Vencedor: {partida.get('vencedor') or 'a definir'}",
-        ]
-        for canal in canais:
-            linhas.append(f"• {canal.mention}: {len(canal.members)} pessoa(s) conectada(s)")
-        await interaction.response.send_message("\n".join(linhas), ephemeral=True)
+        blocos = []
+        # Mostra todas as partidas em andamento no servidor.
+        for _chave, partida in ativas:
+            canais = canal_times(guild, partida)
+            linhas = [
+                f"🎮 **Partida {partida.get('numero', 1)}**",
+                f"🎙️ Origem: <#{partida['origem_id']}>",
+                f"👥 Jogadores sorteados: {len(partida.get('participantes', {}))}",
+                f"🏆 Vencedor: {partida.get('vencedor') or 'a definir'}",
+            ]
+            for canal in canais:
+                linhas.append(f"• {canal.mention}: {len(canal.members)} pessoa(s) conectada(s)")
+            blocos.append("\n".join(linhas))
+        texto = "\n\n".join(blocos)
+        if len(texto) > 2000:
+            texto = texto[:1990] + "\n…"
+        await interaction.response.send_message(texto, ephemeral=True)
 
 
 
@@ -890,6 +1034,33 @@ def fila_total_paginas(fila: dict[str, Any]) -> int:
 
 def fila_pagina(fila: dict[str, Any]) -> int:
     return min(max(0, int(fila.get("pagina", 0))), fila_total_paginas(fila) - 1)
+
+
+def filas_abertas(guild_id: int) -> list[tuple[str, dict[str, Any]]]:
+    """Filas abertas do servidor, da mais antiga para a mais nova."""
+    abertas = [
+        (chave, fila) for chave, fila in filas.items()
+        if fila.get("guild_id") == guild_id and fila.get("status") == "aberta"
+    ]
+    return sorted(abertas, key=lambda item: int(item[0]))
+
+
+def nome_modo_fila(fila: dict[str, Any]) -> str:
+    numero = int(fila["equipes"])
+    tam = tamanho_time(fila)
+    return f"{tam} vs {tam}" if numero == 2 else f"{numero} equipes de {tam}"
+
+
+async def cancelar_fila(guild: discord.Guild, chave: str) -> bool:
+    """Cancela uma fila aberta. Deve ser chamada com a trava do servidor."""
+    fila = filas.get(chave)
+    if not fila or fila.get("status") != "aberta" or fila.get("guild_id") != guild.id:
+        return False
+    fila["status"] = "cancelada"
+    await atualizar_mensagem_fila(guild, fila, fechada=True)
+    filas.pop(chave, None)
+    salvar_filas()
+    return True
 
 
 def montar_embed_fila(fila: dict[str, Any]) -> discord.Embed:
@@ -982,9 +1153,9 @@ async def atualizar_mensagem_fila(
 def valida_fila_interacao(inter: discord.Interaction) -> dict[str, Any] | None:
     if inter.guild_id is None or not inter.message:
         return None
-    fila = filas.get(str(inter.guild_id))
+    fila = filas.get(str(inter.message.id))
     if (not fila or fila.get("status") != "aberta"
-            or fila.get("message_id") != inter.message.id):
+            or fila.get("guild_id") != inter.guild_id):
         return None
     return fila
 
@@ -1128,11 +1299,6 @@ class FilaView(discord.ui.View):
             if fila is None or not fila_cheia(fila):
                 await inter.followup.send("⚠️ A fila ainda não está completa ou já foi encerrada.")
                 return
-            if str(guild.id) in partidas:
-                await inter.followup.send(
-                    "⚠️ Uma partida já está ativa. Finalize-a antes de iniciar outra."
-                )
-                return
             bot_membro = guild.me
             if not bot_membro or not (
                 bot_membro.guild_permissions.manage_channels
@@ -1177,7 +1343,12 @@ class FilaView(discord.ui.View):
 
             fila["status"] = "iniciando"
             salvar_filas()
+            # A partida usa o ID da mensagem da fila como chave própria.
+            chave_partida = str(fila["message_id"])
+            numero = numero_livre_partida(guild.id)
             partida = {
+                "guild_id": guild.id,
+                "numero": numero,
                 "origem_id": origem.id,
                 "categoria_id": None,
                 "canais": {},
@@ -1190,11 +1361,11 @@ class FilaView(discord.ui.View):
                     for chave, membros in times.items() for m in membros
                 },
             }
-            partidas[str(guild.id)] = partida
+            partidas[chave_partida] = partida
             salvar_partidas()
             try:
                 categoria = await guild.create_category(
-                    "🔒 PARTIDA EM ANDAMENTO", reason="Queue: início da partida"
+                    f"🔒 PARTIDA {numero} EM ANDAMENTO", reason="Queue: início da partida"
                 )
                 partida["categoria_id"] = categoria.id
                 salvar_partidas()
@@ -1216,14 +1387,14 @@ class FilaView(discord.ui.View):
                 log.exception("Falha ao criar os canais privados da fila: %s", exc)
                 pendencias = await remover_estrutura(guild, partida)
                 if not guild.get_channel(partida.get("categoria_id")) and not canal_times(guild, partida):
-                    partidas.pop(str(guild.id), None)
+                    partidas.pop(chave_partida, None)
                     salvar_partidas()
                     fila["status"] = "aberta"
                     salvar_filas()
                     await atualizar_mensagem_fila(guild, fila)
                 else:
                     # Preserva o registro parcial para /partida_cancelar.
-                    filas.pop(str(guild.id), None)
+                    filas.pop(str(fila["message_id"]), None)
                     salvar_filas()
                     await atualizar_mensagem_fila(guild, fila, fechada=True)
                 await inter.followup.send(
@@ -1249,12 +1420,13 @@ class FilaView(discord.ui.View):
                         erros.append(membro.display_name)
 
             # A fila vira partida. A finalização usa os mesmos comandos anteriores.
-            filas.pop(str(guild.id), None)
+            filas.pop(str(fila["message_id"]), None)
             salvar_filas()
             await atualizar_mensagem_fila(guild, fila, fechada=True)
             embed = discord.Embed(
                 title="🎮 League of Legends | EQUIPES SORTEADAS",
                 description=(
+                    f"🎮 **Partida {numero}**\n"
                     f"🔒 Cada time tem um canal privado: apenas membros sorteados "
                     f"podem conectar.\n🎙️ Canal original: {origem.mention}\n"
                     f"↪️ {movidos}/{len(jogadores)} jogadores movidos."
@@ -1294,11 +1466,12 @@ class FilaView(discord.ui.View):
 # Administradores podem ignorar restrições de canais do Discord.
 
 class EscolhaEquipeAssistir(discord.ui.View):
-    def __init__(self, usuario_id: int, guild_id: int) -> None:
+    def __init__(self, usuario_id: int, guild_id: int, chave_partida: str) -> None:
         super().__init__(timeout=180)
         self.usuario_id = usuario_id
         self.guild_id = guild_id
-        partida = partidas.get(str(guild_id)) or {}
+        self.chave_partida = chave_partida
+        partida = partidas.get(chave_partida) or {}
         chaves = set((partida.get("canais") or {}).keys())
         for chave, emoji, nome in EQUIPES:
             if chave not in chaves:
@@ -1327,10 +1500,24 @@ class EscolhaEquipeAssistir(discord.ui.View):
             return
         await inter.response.defer(ephemeral=True, thinking=True)
         async with trava_servidor(inter.guild.id):
-            partida = partidas.get(str(inter.guild.id))
+            partida = partidas.get(self.chave_partida)
             if not partida or partida.get("vencedor") is not None:
                 await inter.followup.send("⚠️ A partida já terminou ou está sendo finalizada.")
                 return
+            # Com várias partidas, ninguém joga numa e assiste outra ao mesmo tempo.
+            for outra_chave, outra in partidas_do_servidor(inter.guild.id):
+                if outra_chave == self.chave_partida:
+                    continue
+                if str(inter.user.id) in outra.get("participantes", {}):
+                    await inter.followup.send(
+                        f"🎮 Você é jogador da Partida {outra.get('numero', 1)}."
+                    )
+                    return
+                if str(inter.user.id) in outra.get("espectadores", {}):
+                    await inter.followup.send(
+                        f"🔒 Você já está assistindo à Partida {outra.get('numero', 1)}."
+                    )
+                    return
             if time not in (partida.get("canais") or {}):
                 await inter.followup.send("⚠️ Esse time não está disponível.")
                 return
@@ -1429,9 +1616,13 @@ class AssistirView(discord.ui.View):
         if inter.guild is None or not isinstance(inter.user, discord.Member):
             await inter.response.send_message("Use este botão dentro do servidor.", ephemeral=True)
             return
-        partida = partidas.get(str(inter.guild.id))
-        if (not partida or not inter.message or
-                partida.get("assistir_message_id") != inter.message.id):
+        # Cada mensagem de times sorteados pertence a uma partida específica.
+        chave_partida, partida = next(
+            ((c, p) for c, p in partidas_do_servidor(inter.guild.id)
+             if inter.message and p.get("assistir_message_id") == inter.message.id),
+            (None, None),
+        )
+        if partida is None:
             await inter.response.send_message(
                 "⚠️ Essa partida já terminou ou o painel foi substituído.", ephemeral=True
             )
@@ -1448,7 +1639,7 @@ class AssistirView(discord.ui.View):
             pergunta = "👀 **Qual equipe você quer assistir?**"
         await inter.response.send_message(
             pergunta + "\nVocê poderá ouvir e falar no canal escolhido. Não será possível trocar de time durante a partida.",
-            view=EscolhaEquipeAssistir(inter.user.id, inter.guild.id),
+            view=EscolhaEquipeAssistir(inter.user.id, inter.guild.id, chave_partida),
             ephemeral=True,
         )
 
@@ -1524,12 +1715,7 @@ async def queue(
             return
 
     async with trava_servidor(guild.id):
-        if str(guild.id) in filas:
-            await inter.followup.send("⚠️ Já existe uma fila aberta neste servidor.", ephemeral=True)
-            return
-        if str(guild.id) in partidas:
-            await inter.followup.send("⚠️ Finalize a partida atual antes de abrir uma fila.", ephemeral=True)
-            return
+        # Várias filas e partidas podem existir ao mesmo tempo no mesmo servidor.
         if imagem_nova:
             try:
                 imagem_nome = guardar_imagem_fila(guild.id, imagem_dados)
@@ -1549,6 +1735,7 @@ async def queue(
                 log.info("Queue usando imagem salva em /data: %s", imagem_nome)
 
         fila: dict[str, Any] = {
+            "guild_id": guild.id,
             "equipes": num_equipes,
             "tamanho": tamanho,
             "pagina": 0,
@@ -1573,7 +1760,7 @@ async def queue(
         # mensagem.attachments. O envio já foi aceito sem lançar exceção;
         # nunca excluir o painel por essa lista estar vazia.
         fila["message_id"] = mensagem.id
-        filas[str(guild.id)] = fila
+        filas[str(mensagem.id)] = fila
         salvar_filas()
 
 
@@ -1621,8 +1808,7 @@ async def aplicar_cor_queue(inter: discord.Interaction, cor: str | None) -> None
             )
             return
 
-        fila = filas.get(gid)
-        if fila and fila.get("status") == "aberta":
+        for _chave, fila in filas_abertas(guild.id):
             anterior_fila = fila.get("cor_embed")
             fila["cor_embed"] = cor
             try:
@@ -1655,7 +1841,7 @@ async def aplicar_cor_queue(inter: discord.Interaction, cor: str | None) -> None
         else f"✅ Cor **{cor}** salva permanentemente!"
     )
     if atualizada:
-        texto += " O painel que já estava aberto também foi atualizado."
+        texto += " Os painéis que já estavam abertos também foram atualizados."
     if aviso:
         texto += "\n" + aviso
     await inter.followup.send(
@@ -1804,13 +1990,12 @@ async def queue_imagem(
 
         alterada = False
         falha_painel = None
-        fila = filas.get(str(guild.id))
-        if fila and fila.get("status") == "aberta":
+        for _chave, fila in filas_abertas(guild.id):
             canal = guild.get_channel(fila.get("channel_id"))
             if isinstance(canal, discord.TextChannel):
+                anterior = fila.get("imagem_nome")
                 try:
                     mensagem = await canal.fetch_message(fila["message_id"])
-                    anterior = fila.get("imagem_nome")
                     fila["imagem_nome"] = nome
                     await mensagem.edit(
                         embed=montar_embed_fila(fila),
@@ -1831,8 +2016,8 @@ async def queue_imagem(
     await inter.followup.send(
         "✅ **Imagem/GIF salva e conferida no armazenamento persistente!** "
         "As próximas filas usarão essa imagem automaticamente."
-        + (" O painel aberto também foi atualizado." if alterada else "")
-        + (" ⚠️ O painel atual não foi atualizado. Faça /queue_cancelar e abra outra fila."
+        + (" Os painéis abertos também foram atualizados." if alterada else "")
+        + (" ⚠️ Algum painel aberto não foi atualizado. Faça /queue_cancelar nele e abra outra fila."
            if falha_painel else ""),
         ephemeral=True,
     )
@@ -1880,19 +2065,72 @@ async def on_voice_state_update(
     if membro.bot or antes.channel == depois.channel:
         return
     async with trava_servidor(membro.guild.id):
-        fila = filas.get(str(membro.guild.id))
-        if not fila or fila.get("status") != "aberta":
-            return
-        if membro.id not in fila.get("inscritos", []):
-            return
-        if depois.channel and depois.channel.id == fila["origem_id"]:
-            return
-        fila["inscritos"].remove(membro.id)
-        salvar_filas()
-        await atualizar_mensagem_fila(membro.guild, fila)
+        for _chave, fila in filas_abertas(membro.guild.id):
+            if membro.id not in fila.get("inscritos", []):
+                continue
+            if depois.channel and depois.channel.id == fila["origem_id"]:
+                continue
+            fila["inscritos"].remove(membro.id)
+            salvar_filas()
+            await atualizar_mensagem_fila(membro.guild, fila)
 
 
-@bot.tree.command(name="queue_cancelar", description="Cancela a fila antes de iniciar a partida")
+class SeletorCancelarFila(discord.ui.View):
+    """Menu para escolher qual das filas abertas será cancelada."""
+
+    def __init__(self, usuario_id: int, guild: discord.Guild) -> None:
+        super().__init__(timeout=180)
+        self.usuario_id = usuario_id
+        self.guild_id = guild.id
+        opcoes = []
+        # O Discord aceita no máximo 25 opções em um menu.
+        for numero, (chave, fila) in enumerate(filas_abertas(guild.id)[:25], start=1):
+            sala = guild.get_channel(fila.get("origem_id"))
+            canal_texto = guild.get_channel(fila.get("channel_id"))
+            capacidade = tamanho_time(fila) * int(fila["equipes"])
+            rotulo = (
+                f"Fila {numero} | {nome_modo_fila(fila)} | "
+                f"{len(fila.get('inscritos', []))}/{capacidade} jogadores"
+            )
+            descricao = (
+                f"Sala: {sala.name if sala else 'indisponível'} | "
+                f"Canal: #{canal_texto.name if canal_texto else 'indisponível'}"
+            )
+            opcoes.append(discord.SelectOption(
+                label=rotulo[:100], value=chave, description=descricao[:100], emoji="🛑",
+            ))
+        self.menu = discord.ui.Select(
+            placeholder="Escolha a fila que deseja cancelar",
+            min_values=1, max_values=1, options=opcoes,
+        )
+        self.menu.callback = self.escolher
+        self.add_item(self.menu)
+
+    async def interaction_check(self, inter: discord.Interaction) -> bool:
+        if inter.user.id != self.usuario_id or inter.guild_id != self.guild_id:
+            await inter.response.send_message(
+                "🚫 Somente quem abriu este menu pode usá-lo.", ephemeral=True
+            )
+            return False
+        return True
+
+    async def escolher(self, inter: discord.Interaction) -> None:
+        if inter.guild is None or not autorizado(inter):
+            await inter.response.send_message("⛔ Sem permissão.", ephemeral=True)
+            return
+        chave = self.menu.values[0]
+        await inter.response.defer()
+        async with trava_servidor(inter.guild.id):
+            cancelada = await cancelar_fila(inter.guild, chave)
+        rotulo = next((o.label for o in self.menu.options if o.value == chave), "")
+        texto = (
+            f"✅ Fila cancelada: **{rotulo}**"
+            if cancelada else "⚠️ Essa fila já foi iniciada ou cancelada."
+        )
+        await inter.edit_original_response(content=texto, view=None)
+
+
+@bot.tree.command(name="queue_cancelar", description="Cancela uma fila antes de iniciar a partida")
 @app_commands.guild_only()
 @app_commands.default_permissions(manage_channels=True)
 async def queue_cancelar(inter: discord.Interaction) -> None:
@@ -1901,15 +2139,23 @@ async def queue_cancelar(inter: discord.Interaction) -> None:
         return
     await inter.response.defer(ephemeral=True)
     async with trava_servidor(inter.guild.id):
-        fila = filas.get(str(inter.guild.id))
-        if not fila or fila.get("status") != "aberta":
+        abertas = filas_abertas(inter.guild.id)
+        if not abertas:
             await inter.followup.send("ℹ️ Não há fila aberta.")
             return
-        fila["status"] = "cancelada"
-        await atualizar_mensagem_fila(inter.guild, fila, fechada=True)
-        filas.pop(str(inter.guild.id), None)
-        salvar_filas()
-        await inter.followup.send("✅ Fila cancelada.")
+        # Apenas uma fila aberta: cancela direto, sem perguntar.
+        if len(abertas) == 1:
+            await cancelar_fila(inter.guild, abertas[0][0])
+            await inter.followup.send("✅ Fila cancelada.")
+            return
+        aviso = (
+            f"\n⚠️ Mostrando as 25 filas mais antigas de {len(abertas)}."
+            if len(abertas) > 25 else ""
+        )
+        await inter.followup.send(
+            f"🛑 Há **{len(abertas)} filas abertas**. Selecione qual deseja cancelar:{aviso}",
+            view=SeletorCancelarFila(inter.user.id, inter.guild),
+        )
 
 
 @bot.tree.error
