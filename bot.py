@@ -34,6 +34,17 @@ ARQUIVO_CORES_FILA = Path("/data/queue_cores.json")
 ARQUIVO_PRESENCA = Path("/data/bot_presenca.json")
 PASTA_IMAGENS_FILA = Path("/data/queue_imagens")
 TAMANHO_TIME = 5
+# Modos do /queue: valor -> (rótulo, nº de equipes, jogadores por equipe).
+MODOS_FILA = {
+    "2x2": ("⚔️ 2 vs 2", 2, 2),
+    "2x3": ("⚔️ 3 vs 3", 2, 3),
+    "2x4": ("⚔️ 4 vs 4", 2, 4),
+    "2x5": ("⚔️ 5 vs 5 (2 equipes)", 2, 5),
+    "3x5": ("🏅 3 equipes de 5", 3, 5),
+    "4x5": ("🏅 4 equipes de 5", 4, 5),
+    "5x5": ("🏅 5 equipes de 5", 5, 5),
+    "6x5": ("🏅 6 equipes de 5", 6, 5),
+}
 # De 2 a 6 equipes de cinco participantes; o painel visual tem SEMPRE duas colunas.
 EQUIPES = (
     ("vermelho", "🔴", "Vermelho"),
@@ -861,14 +872,20 @@ async def partida_status(interaction: discord.Interaction) -> None:
 # Inscrições (colunas) não são os times definitivos: o sorteio ocorre em Iniciar.
 
 
+def tamanho_time(fila: dict[str, Any]) -> int:
+    # Filas antigas (sem "tamanho") continuam com 5 jogadores por equipe.
+    return int(fila.get("tamanho", TAMANHO_TIME))
+
+
 def fila_cheia(fila: dict[str, Any]) -> bool:
-    return len(fila.get("inscritos", [])) == TAMANHO_TIME * int(fila["equipes"])
+    return len(fila.get("inscritos", [])) == tamanho_time(fila) * int(fila["equipes"])
 
 
 def fila_total_paginas(fila: dict[str, Any]) -> int:
-    # Duas colunas de cinco vagas por página, mesmo para até 25 inscritos.
-    capacidade = TAMANHO_TIME * int(fila["equipes"])
-    return max(1, (capacidade + 9) // 10)
+    # Duas colunas por página, cada uma com o tamanho de um time.
+    tam = tamanho_time(fila)
+    capacidade = tam * int(fila["equipes"])
+    return max(1, -(-capacidade // (2 * tam)))
 
 
 def fila_pagina(fila: dict[str, Any]) -> int:
@@ -877,16 +894,21 @@ def fila_pagina(fila: dict[str, Any]) -> int:
 
 def montar_embed_fila(fila: dict[str, Any]) -> discord.Embed:
     numero = int(fila["equipes"])
+    tam = tamanho_time(fila)
     inscritos = fila.get("inscritos", [])
-    capacidade = TAMANHO_TIME * numero
+    capacidade = tam * numero
     cheio = len(inscritos) == capacidade
     pagina = fila_pagina(fila)
+    modo = (
+        f"🏅 **Modo:** {tam} vs {tam}" if numero == 2
+        else f"🏅 **Equipes:** {numero} times de {tam} jogadores"
+    )
     embed = discord.Embed(
         title="🎮 League of Legends | FILA PARA PARTIDA",
         description=(
             f"🎙️ **Sala de espera:** <#{fila['origem_id']}>\n"
             f"👥 **Vagas preenchidas:** {len(inscritos)}/{capacidade}\n"
-            f"🏅 **Equipes:** {numero} times de {TAMANHO_TIME} jogadores\n\n"
+            f"{modo}\n\n"
             + (
                 "✅ **Fila completa! O botão Iniciar está disponível para o dono.**"
                 if cheio else "Clique em **Entrar** para participar ou **Sair** para cancelar."
@@ -896,9 +918,9 @@ def montar_embed_fila(fila: dict[str, Any]) -> discord.Embed:
     )
     # Sempre exatamente duas colunas. Páginas extras não criam novas colunas.
     for coluna, (emoji, nome) in enumerate((("🔴", "Vermelho"), ("🔵", "Azul"))):
-        inicio = pagina * 10 + coluna * TAMANHO_TIME
+        inicio = pagina * 2 * tam + coluna * tam
         linhas = []
-        for indice in range(inicio, inicio + TAMANHO_TIME):
+        for indice in range(inicio, inicio + tam):
             if indice >= capacidade:
                 linhas.append("▫️ Sem vaga")
             elif indice < len(inscritos):
@@ -1147,8 +1169,9 @@ class FilaView(discord.ui.View):
             # Os jogadores são embaralhados apenas AQUI, não na ordem da inscrição.
             jogadores = [por_id[uid] for uid in fila["inscritos"]]
             random.SystemRandom().shuffle(jogadores)
+            tam = tamanho_time(fila)
             times = {
-                chave: jogadores[i * TAMANHO_TIME:(i + 1) * TAMANHO_TIME]
+                chave: jogadores[i * tam:(i + 1) * tam]
                 for i, (chave, _emoji, _nome) in enumerate(EQUIPES[:fila["equipes"]])
             }
 
@@ -1430,22 +1453,32 @@ class AssistirView(discord.ui.View):
         )
 
 
-@bot.tree.command(name="queue", description="Abre uma fila com 5 jogadores por equipe e sorteio ao iniciar")
+@bot.tree.command(
+    name="queue",
+    description="Abre uma fila (2v2, 3v3, 4v4 ou equipes de 5) com sorteio ao iniciar",
+)
 @app_commands.describe(
-    equipes="Número de equipes (de 2 a 6, com 5 jogadores em cada)",
+    equipes="Modo da fila: 2v2, 3v3, 4v4 ou de 2 a 6 equipes de 5 jogadores",
     canal="Sala de voz de espera; se vazio, usa a sala em que você está",
     imagem="Foto/GIF para salvar como imagem padrão da fila (opcional)",
     link_imagem="Link HTTPS direto para salvar como imagem padrão (opcional)",
+)
+@app_commands.choices(
+    equipes=[
+        app_commands.Choice(name=rotulo, value=valor)
+        for valor, (rotulo, _n, _t) in MODOS_FILA.items()
+    ]
 )
 @app_commands.guild_only()
 @app_commands.default_permissions(manage_channels=True)
 async def queue(
     inter: discord.Interaction,
-    equipes: app_commands.Range[int, 2, 6] = 2,
+    equipes: app_commands.Choice[str] | None = None,
     canal: discord.VoiceChannel | None = None,
     imagem: discord.Attachment | None = None,
     link_imagem: str | None = None,
 ) -> None:
+    _rotulo, num_equipes, tamanho = MODOS_FILA[equipes.value if equipes else "2x5"]
     if inter.guild is None or not autorizado(inter):
         await inter.response.send_message(
             "⛔ Apenas quem tem **Gerenciar Canais** pode abrir uma queue.", ephemeral=True
@@ -1516,7 +1549,8 @@ async def queue(
                 log.info("Queue usando imagem salva em /data: %s", imagem_nome)
 
         fila: dict[str, Any] = {
-            "equipes": equipes,
+            "equipes": num_equipes,
+            "tamanho": tamanho,
             "pagina": 0,
             "origem_id": canal.id,
             "channel_id": inter.channel.id,
