@@ -1067,6 +1067,37 @@ def salvar_contas_riot() -> None:
     temporario.replace(ARQUIVO_CONTAS_RIOT)
 
 
+# Cada pessoa pode ter várias contas: {"ID do Discord": {"contas": [conta, ...]}}.
+# O formato antigo (uma conta por pessoa) é convertido automaticamente.
+MAX_CONTAS_RIOT = 5
+# Além do dono, quem tem este cargo pode vincular/remover contas de outros membros.
+CARGO_GERENCIAR_CONTAS = 1049073332357701704
+_contas_convertidas = False
+for _uid_riot, _registro_riot in list(contas_riot.items()):
+    if isinstance(_registro_riot, dict) and "puuid" in _registro_riot:
+        contas_riot[_uid_riot] = {"contas": [_registro_riot]}
+        _contas_convertidas = True
+if _contas_convertidas:
+    salvar_contas_riot()
+
+
+def contas_do_usuario(usuario_id: int) -> list[dict[str, Any]]:
+    registro = contas_riot.get(str(usuario_id))
+    return list(registro.get("contas", [])) if isinstance(registro, dict) else []
+
+
+def encontrar_conta_riot(
+    contas: list[dict[str, Any]], texto: str
+) -> dict[str, Any] | None:
+    """Acha a conta pelo valor do autocompletar (PUUID) ou pelo Riot ID digitado."""
+    texto = (texto or "").strip()
+    return next(
+        (c for c in contas
+         if c.get("puuid") == texto or c.get("riot_id", "").casefold() == texto.casefold()),
+        None,
+    )
+
+
 class ErroRiot(Exception):
     def __init__(self, status: int, mensagem: str) -> None:
         super().__init__(mensagem)
@@ -1136,8 +1167,15 @@ async def buscar_conta_riot(nome: str, tag: str) -> dict[str, Any]:
     return dados
 
 
-def formatar_elo(entradas: Any) -> str:
-    """Mostra apenas a ranqueada Solo/Duo oficial."""
+ORDEM_TIERS = [
+    "IRON", "BRONZE", "SILVER", "GOLD", "PLATINUM", "EMERALD",
+    "DIAMOND", "MASTER", "GRANDMASTER", "CHALLENGER",
+]
+ORDEM_DIVISOES = {"IV": 0, "III": 1, "II": 2, "I": 3}
+
+
+def formatar_elo(entradas: Any) -> tuple[str, int]:
+    """Texto do elo Solo/Duo oficial e um número para saber qual conta tem o maior."""
     solo = None
     if isinstance(entradas, list):
         solo = next(
@@ -1146,16 +1184,21 @@ def formatar_elo(entradas: Any) -> str:
             None,
         )
     if not solo:
-        return "Sem ranque"
+        return "Sem ranque", -1
     tier = str(solo.get("tier", ""))
     nome = NOMES_TIER.get(tier, tier.title())
-    pdl = solo.get("leaguePoints", 0)
+    pdl = int(solo.get("leaguePoints", 0) or 0)
+    divisao = str(solo.get("rank", ""))
+    ordem = (
+        (ORDEM_TIERS.index(tier) if tier in ORDEM_TIERS else 0) * 10000
+        + ORDEM_DIVISOES.get(divisao, 0) * 1000 + pdl
+    )
     if tier in ("MASTER", "GRANDMASTER", "CHALLENGER"):
-        return f"{nome} ({pdl} PDL)"
-    return f"{nome} {solo.get('rank', '')} ({pdl} PDL)"
+        return f"{nome} ({pdl} PDL)", ordem
+    return f"{nome} {divisao} ({pdl} PDL)", ordem
 
 
-async def buscar_elo(puuid: str) -> str:
+async def buscar_elo(puuid: str) -> tuple[str, int]:
     dados = await chamar_riot(
         f"https://{RIOT_PLATAFORMA}.api.riotgames.com/lol/league/v4/entries/by-puuid/"
         f"{quote(puuid, safe='')}"
@@ -1164,44 +1207,100 @@ async def buscar_elo(puuid: str) -> str:
 
 
 async def atualizar_elo_se_preciso(usuario_id: int, limite: float = 2.0) -> None:
-    """Atualiza o elo salvo se estiver antigo. Em caso de falha, mantém o anterior."""
-    conta = contas_riot.get(str(usuario_id))
-    if not conta or not RIOT_API_KEY:
+    """Atualiza o elo salvo das contas antigas. Em caso de falha, mantém o anterior."""
+    if not RIOT_API_KEY:
         return
-    if time.time() - float(conta.get("elo_em", 0)) < ELO_VALIDADE_SEGUNDOS:
+    antigas = [
+        c for c in contas_do_usuario(usuario_id)
+        if time.time() - float(c.get("elo_em", 0)) >= ELO_VALIDADE_SEGUNDOS
+    ]
+    if not antigas:
         return
-    try:
-        elo = await asyncio.wait_for(buscar_elo(conta["puuid"]), timeout=limite)
-    except (ErroRiot, aiohttp.ClientError, asyncio.TimeoutError, ValueError, KeyError) as exc:
-        log.warning("Não consegui atualizar o elo de %s: %s", usuario_id, exc)
-        return
+    resultados = await asyncio.gather(
+        *(asyncio.wait_for(buscar_elo(c["puuid"]), timeout=limite) for c in antigas),
+        return_exceptions=True,
+    )
+    mudou = False
     async with trava_contas_riot:
-        conta["elo"] = elo
-        conta["elo_em"] = time.time()
-        try:
-            salvar_contas_riot()
-        except OSError as exc:
-            log.warning("Não consegui salvar contas_riot.json: %s", exc)
+        for conta, resultado in zip(antigas, resultados):
+            if isinstance(resultado, BaseException):
+                log.warning("Não consegui atualizar o elo de %s: %s", usuario_id, resultado)
+                continue
+            conta["elo"], conta["elo_ordem"] = resultado
+            conta["elo_em"] = time.time()
+            mudou = True
+        if mudou:
+            try:
+                salvar_contas_riot()
+            except OSError as exc:
+                log.warning("Não consegui salvar contas_riot.json: %s", exc)
 
 
 def texto_elo(usuario_id: int) -> str:
-    """Trecho exibido ao lado do jogador no painel da fila."""
-    conta = contas_riot.get(str(usuario_id))
-    if not conta or not conta.get("elo"):
+    """Trecho exibido ao lado do jogador no painel da fila (maior elo entre as contas)."""
+    contas = [c for c in contas_do_usuario(usuario_id) if c.get("elo")]
+    if not contas:
         return ""
-    return f" • {conta['elo']}"
+    maior = max(contas, key=lambda c: int(c.get("elo_ordem", -1)))
+    return f" • {maior['elo']}"
+
+
+async def pode_gerenciar_contas(inter: discord.Interaction) -> bool:
+    """Dono do servidor/bot ou quem tem o cargo autorizado."""
+    if isinstance(inter.user, discord.Member) and any(
+        cargo.id == CARGO_GERENCIAR_CONTAS for cargo in inter.user.roles
+    ):
+        return True
+    return await dono_da_fila(inter)
+
+
+async def atualizar_paineis_do_jogador(guild: discord.Guild, usuario_id: int) -> None:
+    """Redesenha os painéis de fila abertos em que o jogador está inscrito."""
+    async with trava_servidor(guild.id):
+        for _chave, fila in filas_abertas(guild.id):
+            if usuario_id in fila.get("inscritos", []):
+                await atualizar_mensagem_fila(guild, fila)
+
+
+async def autocompletar_conta_riot(
+    inter: discord.Interaction, atual: str
+) -> list[app_commands.Choice[str]]:
+    """Lista as contas Riot do membro escolhido no comando (ou de quem está digitando)."""
+    alvo = getattr(inter.namespace, "jogador", None) or getattr(inter.namespace, "membro", None)
+    usuario_id = getattr(alvo, "id", None) or inter.user.id
+    texto = (atual or "").casefold()
+    return [
+        app_commands.Choice(name=c.get("riot_id", "?")[:100], value=c["puuid"])
+        for c in contas_do_usuario(usuario_id)
+        if texto in c.get("riot_id", "").casefold() and len(c.get("puuid", "")) <= 100
+    ][:25]
 
 
 @bot.tree.command(
-    name="link", description="Vincula sua conta do League of Legends (Riot ID) ao Discord"
+    name="link", description="Vincula uma conta do League of Legends (Riot ID) ao Discord"
 )
-@app_commands.describe(riot_id="Seu Riot ID no formato Nick#TAG (exemplo: Nick#BR1)")
-async def link(inter: discord.Interaction, riot_id: str) -> None:
+@app_commands.describe(
+    riot_id="Riot ID no formato Nick#TAG (exemplo: Nick#BR1)",
+    membro="Vincular a conta para outro membro (só o dono ou o cargo autorizado)",
+)
+async def link(
+    inter: discord.Interaction, riot_id: str, membro: Optional[discord.Member] = None
+) -> None:
     if not RIOT_API_KEY:
         await inter.response.send_message(
             "⚠️ A API da Riot ainda não foi configurada no bot (RIOT_API_KEY).",
             ephemeral=True,
         )
+        return
+    alvo = membro or inter.user
+    if alvo.id != inter.user.id and not await pode_gerenciar_contas(inter):
+        await inter.response.send_message(
+            "🔒 Só o dono ou quem tem o cargo autorizado pode vincular contas de outros membros.",
+            ephemeral=True,
+        )
+        return
+    if alvo.bot:
+        await inter.response.send_message("⚠️ Bots não podem ter conta vinculada.", ephemeral=True)
         return
     nome, separador, tag = riot_id.strip().rpartition("#")
     nome, tag = nome.strip(), tag.strip()
@@ -1214,7 +1313,7 @@ async def link(inter: discord.Interaction, riot_id: str) -> None:
     await inter.response.defer(ephemeral=True, thinking=True)
     try:
         conta = await buscar_conta_riot(nome, tag)
-        elo = await buscar_elo(conta["puuid"])
+        elo, elo_ordem = await buscar_elo(conta["puuid"])
     except ErroRiot as exc:
         await inter.followup.send(f"⚠️ {exc}", ephemeral=True)
         return
@@ -1227,15 +1326,42 @@ async def link(inter: discord.Interaction, riot_id: str) -> None:
         return
 
     riot_nome = f"{conta.get('gameName') or nome}#{conta.get('tagLine') or tag}"
-    chave = str(inter.user.id)
+    puuid = conta["puuid"]
+    chave = str(alvo.id)
     async with trava_contas_riot:
-        anterior = contas_riot.get(chave)
-        contas_riot[chave] = {
-            "puuid": conta["puuid"],
+        # A mesma conta Riot não pode ficar vinculada a duas pessoas.
+        for outro_id, registro in contas_riot.items():
+            if outro_id != chave and any(
+                c.get("puuid") == puuid for c in (registro or {}).get("contas", [])
+            ):
+                await inter.followup.send(
+                    f"⚠️ Essa conta já está vinculada a <@{outro_id}>.", ephemeral=True,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+                return
+        registro = contas_riot.get(chave)
+        lista = list(registro.get("contas", [])) if isinstance(registro, dict) else []
+        existente = next((c for c in lista if c.get("puuid") == puuid), None)
+        if existente is None and len(lista) >= MAX_CONTAS_RIOT:
+            await inter.followup.send(
+                f"⚠️ Limite de {MAX_CONTAS_RIOT} contas por pessoa. "
+                "Remova uma com `/desvincular` antes de adicionar outra.",
+                ephemeral=True,
+            )
+            return
+        nova = {
+            "puuid": puuid,
             "riot_id": riot_nome,
             "elo": elo,
+            "elo_ordem": elo_ordem,
             "elo_em": time.time(),
         }
+        if existente is None:
+            lista.append(nova)
+        else:
+            lista[lista.index(existente)] = nova
+        anterior = registro
+        contas_riot[chave] = {"contas": lista}
         try:
             salvar_contas_riot()
         except OSError as exc:
@@ -1248,21 +1374,77 @@ async def link(inter: discord.Interaction, riot_id: str) -> None:
                 "⚠️ Não consegui salvar o vínculo em /data/contas_riot.json.", ephemeral=True
             )
             return
+        total = len(lista)
 
-    # Atualiza os painéis de fila abertos em que o jogador já está inscrito.
     if inter.guild is not None:
-        async with trava_servidor(inter.guild.id):
-            for _chave, fila in filas_abertas(inter.guild.id):
-                if inter.user.id in fila.get("inscritos", []):
-                    await atualizar_mensagem_fila(inter.guild, fila)
+        await atualizar_paineis_do_jogador(inter.guild, alvo.id)
 
+    dono_conta = "Conta vinculada" if alvo.id == inter.user.id else f"Conta vinculada a {alvo.mention}"
     await inter.followup.send(
-        f"✅ Conta vinculada: **{discord.utils.escape_markdown(riot_nome)}**\n"
+        f"✅ {dono_conta}: **{discord.utils.escape_markdown(riot_nome)}**\n"
         f"🏅 Elo (Solo/Duo): **{elo}**\n"
-        "Seu elo vai aparecer ao seu lado no painel da fila. "
-        "Para trocar de conta, use `/link` de novo.\n\n"
+        f"📚 Contas vinculadas: **{total}/{MAX_CONTAS_RIOT}**\n"
+        "No painel da fila aparece o maior elo entre as contas. "
+        "Para remover uma conta, use `/desvincular`.\n\n"
         f"-# {AVISO_RIOT}",
         ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+@bot.tree.command(
+    name="desvincular", description="Remove uma conta do League of Legends vinculada"
+)
+@app_commands.describe(
+    conta="Conta Riot que será removida",
+    membro="Remover de outro membro (só o dono ou o cargo autorizado)",
+)
+@app_commands.autocomplete(conta=autocompletar_conta_riot)
+async def desvincular(
+    inter: discord.Interaction, conta: str, membro: Optional[discord.Member] = None
+) -> None:
+    alvo = membro or inter.user
+    if alvo.id != inter.user.id and not await pode_gerenciar_contas(inter):
+        await inter.response.send_message(
+            "🔒 Só o dono ou quem tem o cargo autorizado pode remover contas de outros membros.",
+            ephemeral=True,
+        )
+        return
+    await inter.response.defer(ephemeral=True, thinking=True)
+    chave = str(alvo.id)
+    async with trava_contas_riot:
+        registro = contas_riot.get(chave)
+        lista = list(registro.get("contas", [])) if isinstance(registro, dict) else []
+        escolhida = encontrar_conta_riot(lista, conta)
+        if escolhida is None:
+            await inter.followup.send(
+                "⚠️ Conta não encontrada. Escolha uma das opções que aparecem ao digitar.",
+                ephemeral=True,
+            )
+            return
+        lista.remove(escolhida)
+        if lista:
+            contas_riot[chave] = {"contas": lista}
+        else:
+            contas_riot.pop(chave, None)
+        try:
+            salvar_contas_riot()
+        except OSError as exc:
+            contas_riot[chave] = registro
+            log.exception("Não consegui salvar a remoção da conta Riot: %s", exc)
+            await inter.followup.send(
+                "⚠️ Não consegui salvar em /data/contas_riot.json.", ephemeral=True
+            )
+            return
+
+    if inter.guild is not None:
+        await atualizar_paineis_do_jogador(inter.guild, alvo.id)
+    await inter.followup.send(
+        f"🗑️ Conta removida: **{discord.utils.escape_markdown(escolhida.get('riot_id', ''))}**"
+        + ("" if alvo.id == inter.user.id else f" (de {alvo.mention})")
+        + f"\n📚 Contas restantes: **{len(lista)}**",
+        ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none(),
     )
 
 
@@ -1539,7 +1721,7 @@ def texto_estatisticas(
     melhor = _melhor(campeoes)
     if melhor["v"]:
         linhas.append(
-            f"🏆 Melhor campeão: {melhor['nome']} — {melhor['v']}V {melhor['j'] - melhor['v']}D "
+            f"🏆 Melhor campeão: {melhor['nome']} - {melhor['v']}V {melhor['j'] - melhor['v']}D "
             f"({_porcentagem(melhor['v'], melhor['j'])}%)"
         )
     else:
@@ -1548,7 +1730,7 @@ def texto_estatisticas(
     derrotas = mais_derrotas["j"] - mais_derrotas["v"]
     if derrotas:
         linhas.append(
-            f"📉 Mais derrotas com: {mais_derrotas['nome']} — {derrotas} derrota(s) "
+            f"📉 Mais derrotas com: {mais_derrotas['nome']} - {derrotas} derrota(s) "
             f"em {mais_derrotas['j']} jogo(s)"
         )
     else:
@@ -1564,7 +1746,7 @@ def texto_estatisticas(
             f"✅ Rota com mais vitórias: {mais_vitorias['nome']} ({mais_vitorias['v']} vitórias)"
         )
         linhas.append(
-            f"🎯 Melhor rota: **{melhor_rota['nome']}** — "
+            f"🎯 Melhor rota: **{melhor_rota['nome']}** - "
             f"{_porcentagem(melhor_rota['v'], melhor_rota['j'])}% de vitórias "
             f"em {melhor_rota['j']} jogo(s)"
         )
@@ -1580,7 +1762,9 @@ def texto_estatisticas(
     equipe="Um time da partida em andamento, ou Todos os times de uma vez",
     jogador="Ver apenas um jogador (se vazio e sem equipe, mostra você)",
     partida="Número da partida, se houver mais de uma em andamento",
+    conta_riot="Qual conta Riot ver (do jogador escolhido ou sua). Se vazio, mostra todas",
 )
+@app_commands.rename(conta_riot="conta")
 @app_commands.choices(
     equipe=[
         app_commands.Choice(name="👥 Todos os times", value="todos"),
@@ -1590,12 +1774,14 @@ def texto_estatisticas(
         ],
     ]
 )
+@app_commands.autocomplete(conta_riot=autocompletar_conta_riot)
 @app_commands.guild_only()
 async def estatisticas(
     inter: discord.Interaction,
     equipe: app_commands.Choice[str] | None = None,
     jogador: discord.Member | None = None,
     partida: Optional[app_commands.Range[int, 1, 99]] = None,
+    conta_riot: Optional[str] = None,
 ) -> None:
     guild = inter.guild
     if guild is None:
@@ -1654,49 +1840,86 @@ async def estatisticas(
             )
             return
 
+    # Contas Riot de cada jogador. Uma conta específica só vale ao ver um jogador.
+    grupos_contas: list[tuple[str, list[tuple[str, list[dict[str, Any]]]]]] = []
+    for titulo, ids in grupos:
+        itens = []
+        for uid in ids[:6]:
+            membro_alvo = guild.get_member(uid)
+            nome_membro = membro_alvo.display_name if membro_alvo else f"Jogador {uid}"
+            contas = contas_do_usuario(uid)
+            if conta_riot and equipe is None:
+                escolhida_conta = encontrar_conta_riot(contas, conta_riot)
+                if escolhida_conta is None:
+                    await inter.response.send_message(
+                        f"⚠️ Não encontrei essa conta em {nome_membro}. "
+                        "Escolha uma das opções que aparecem ao digitar.",
+                        ephemeral=True,
+                    )
+                    return
+                contas = [escolhida_conta]
+            itens.append((nome_membro, contas))
+        grupos_contas.append((titulo, itens))
+
     await inter.response.defer(ephemeral=True, thinking=True)
     nomes = await nomes_campeoes()
-    # Com muitos jogadores, analisa menos partidas de cada um para não demorar demais.
-    total_jogadores = sum(len(ids) for _t, ids in grupos)
-    quantidade = PARTIDAS_ANALISADAS if total_jogadores <= 10 else 8
+    # Com muitas contas, analisa menos partidas de cada uma para não demorar demais.
+    total_contas = sum(len(c) for _t, itens in grupos_contas for _n, c in itens)
+    quantidade = PARTIDAS_ANALISADAS if total_contas <= 10 else 8
+    rodape = f"Últimas {quantidade} partidas de Summoner's Rift (normal e ranqueada)."
     chave_invalida = False
     # Cada time é enviado assim que fica pronto, sem esperar os outros.
-    for titulo, ids in grupos:
-        embed = discord.Embed(title=titulo, color=0x5865F2)
-        for uid in ids[:6]:
-            membro = guild.get_member(uid)
-            nome_membro = membro.display_name if membro else f"Jogador {uid}"
-            conta = contas_riot.get(str(uid))
-            if not conta:
-                embed.add_field(
-                    name=nome_membro, value="🔗 Ainda não vinculou a conta (`/link Nick#TAG`).",
-                    inline=False,
+    for titulo, itens in grupos_contas:
+        campos: list[tuple[str, str]] = []
+        for nome_membro, contas in itens:
+            if not contas:
+                campos.append(
+                    (nome_membro, "🔗 Ainda não vinculou a conta (`/link Nick#TAG`).")
                 )
                 continue
-            if chave_invalida:
-                embed.add_field(name=nome_membro, value="⚠️ Consulta interrompida.", inline=False)
-                continue
-            try:
-                dados = await dados_estatisticas(conta["puuid"], quantidade)
-            except ErroRiot as exc:
-                embed.add_field(name=nome_membro, value=f"⚠️ {exc}", inline=False)
-                chave_invalida = exc.status in (401, 403)
-                continue
-            except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, KeyError) as exc:
-                log.warning("Falha nas estatísticas de %s: %s", uid, exc)
-                embed.add_field(
-                    name=nome_membro, value="⚠️ Não consegui falar com a Riot agora.",
-                    inline=False,
+            for conta in contas:
+                # Com mais de uma conta, o nome do campo mostra qual é.
+                nome_campo = (
+                    nome_membro if len(contas) == 1
+                    else f"{nome_membro} | {conta.get('riot_id', '')}"
                 )
-                continue
-            icones = await icones_campeoes(ids_campeoes_estatisticas(dados))
-            embed.add_field(
-                name=nome_membro, value=texto_estatisticas(conta, dados, nomes, icones),
-                inline=False,
+                if chave_invalida:
+                    campos.append((nome_campo, "⚠️ Consulta interrompida."))
+                    continue
+                try:
+                    dados = await dados_estatisticas(conta["puuid"], quantidade)
+                except ErroRiot as exc:
+                    campos.append((nome_campo, f"⚠️ {exc}"))
+                    chave_invalida = exc.status in (401, 403)
+                    continue
+                except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, KeyError) as exc:
+                    log.warning("Falha nas estatísticas de %s: %s", nome_membro, exc)
+                    campos.append((nome_campo, "⚠️ Não consegui falar com a Riot agora."))
+                    continue
+                icones = await icones_campeoes(ids_campeoes_estatisticas(dados))
+                campos.append((nome_campo, texto_estatisticas(conta, dados, nomes, icones)))
+        await enviar_campos_em_embeds(inter, titulo, campos, rodape)
+
+
+async def enviar_campos_em_embeds(
+    inter: discord.Interaction, titulo: str, campos: list[tuple[str, str]], rodape: str
+) -> None:
+    """Divide os campos em vários embeds para respeitar os limites do Discord."""
+    embeds: list[discord.Embed] = []
+    tamanho = 0
+    for nome, valor in campos:
+        nome = nome[:256]
+        if (not embeds or len(embeds[-1].fields) >= 25
+                or tamanho + len(nome) + len(valor) > 5500):
+            embed = discord.Embed(
+                title=titulo if not embeds else f"{titulo} (continuação)", color=0x5865F2
             )
-        embed.set_footer(
-            text=f"Últimas {quantidade} partidas de Summoner's Rift (normal e ranqueada)."
-        )
+            embed.set_footer(text=rodape)
+            embeds.append(embed)
+            tamanho = len(embed.title or "") + len(rodape)
+        embeds[-1].add_field(name=nome, value=valor, inline=False)
+        tamanho += len(nome) + len(valor)
+    for embed in embeds:
         await inter.followup.send(embed=embed, ephemeral=True)
 
 
