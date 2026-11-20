@@ -3970,6 +3970,26 @@ def dono_da_conta_riot(puuid: str) -> int | None:
     return None
 
 
+def caber_no_discord(embeds: list[discord.Embed], limite: int = 5900) -> None:
+    """O Discord recusa mensagens com mais de 6000 caracteres em embeds.
+    Se passar, remove primeiro as linhas menos importantes."""
+    for prefixo in ("✨", "🔁", "👑", "👤"):
+        if sum(len(e) for e in embeds) <= limite:
+            return
+        for e in embeds:
+            for i, campo in enumerate(e.fields):
+                nova = "\n".join(
+                    linha for linha in campo.value.split("\n") if not linha.startswith(prefixo)
+                )
+                if nova != campo.value:
+                    e.set_field_at(i, name=campo.name, value=nova or "-", inline=campo.inline)
+    for e in embeds:
+        for i, campo in enumerate(e.fields):
+            if sum(len(x) for x in embeds) <= limite:
+                return
+            e.set_field_at(i, name=campo.name[:60], value=campo.value[:400], inline=campo.inline)
+
+
 async def montar_aovivo(
     jogo: dict[str, Any], puuid_ref: str, com_desempenho: bool = True
 ) -> list[discord.Embed]:
@@ -4052,6 +4072,8 @@ async def montar_aovivo(
                     + (f"({vezes} das últimas {AOVIVO_HISTORICO_PARTIDAS})"
                        if vezes >= AOVIVO_MINIMO_JUNTOS else "(membros do servidor)")
                 )
+            elif not p.get("bot"):
+                linhas.append("👤 Sem grupo identificado (provavelmente sozinho)")
             if p.get("bot"):
                 linhas.append("🤖 Bot")
             else:
@@ -4073,12 +4095,17 @@ async def montar_aovivo(
                         principal = maestrias[0]
                         pid = int(principal.get("championId", 0))
                         if pid == cid:
-                            linhas.append("👑 Esse é o campeão principal dele")
+                            linhas.append(
+                                f"👑 Principal: {nomes.get(pid, f'Campeão {pid}')} (é o campeão "
+                                f"atual • {_pontos(principal.get('championPoints'))} pts)"
+                            )
                         else:
                             linhas.append(
                                 f"👑 Principal: {nomes.get(pid, f'Campeão {pid}')} "
                                 f"({_pontos(principal.get('championPoints'))} pts)"
                             )
+                    else:
+                        linhas.append("👑 Principal: sem maestria em nenhum campeão")
             if desempenhos[indice]:
                 linhas.append(desempenhos[indice])
             nomes_f = [feiticos.get(int(p.get(k) or 0)) for k in ("spell1Id", "spell2Id")]
@@ -4107,14 +4134,15 @@ async def montar_aovivo(
                 "\n-# Grupos são estimados pelas partidas recentes em comum; a Riot não informa isso."
             )
         embeds[-1].set_footer(text=AVISO_RIOT[:2048])
+    caber_no_discord(embeds)
     return embeds
 
 
 AOVIVO_PARTIDAS_DESEMPENHO = 5  # Partidas recentes abertas por jogador.
 
 
-async def texto_desempenho(puuid: str, cid: int, nomes: dict[int, str]) -> str:
-    """Vitórias/derrotas recentes, desempenho com o campeão atual e o mais jogado."""
+async def jogos_recentes(puuid: str) -> list[dict[str, Any]]:
+    """Últimas partidas do jogador (campeão, vitória, rota, modo e horário)."""
     jogos = []
     ids = (await partidas_recentes_lista(puuid))[:AOVIVO_PARTIDAS_DESEMPENHO]
     resumos = await asyncio.gather(
@@ -4130,7 +4158,13 @@ async def texto_desempenho(puuid: str, cid: int, nomes: dict[int, str]) -> str:
             continue
         eu = next((x for x in resumo["participantes"] if x["puuid"] == puuid), None)
         if eu:
-            jogos.append(eu)
+            jogos.append({**eu, "fila": resumo["fila"], "fim": resumo["fim"]})
+    return jogos
+
+
+async def texto_desempenho(puuid: str, cid: int, nomes: dict[int, str]) -> str:
+    """Vitórias/derrotas recentes, desempenho com o campeão atual e o mais jogado."""
+    jogos = await jogos_recentes(puuid)
     if not jogos:
         return "📈 Sem partidas recentes"
     v = sum(1 for j in jogos if j["vitoria"])
@@ -4152,12 +4186,144 @@ async def texto_desempenho(puuid: str, cid: int, nomes: dict[int, str]) -> str:
         contagem[j["campeao_id"]][0] += 1
         contagem[j["campeao_id"]][1] += int(j["vitoria"])
     mais_id, (qtd, vit) = max(contagem.items(), key=lambda item: (item[1][0], item[1][1]))
-    if qtd >= 2 and mais_id != cid:
+    if qtd >= 2:
+        atual_txt = " (é o atual)" if mais_id == cid else ""
         linhas.append(
-            f"🔁 Mais jogado: {nomes.get(mais_id, f'Campeão {mais_id}')} • {qtd} jogos • "
+            f"🔁 Mais jogado: {nomes.get(mais_id, f'Campeão {mais_id}')}{atual_txt} • {qtd} jogos • "
             f"{vit}V {qtd - vit}D"
         )
+    else:
+        linhas.append(f"🔁 Mais jogado: nenhum repetido nas últimas {len(jogos)}")
     return "\n".join(linhas)
+
+
+async def detalhes_jogador(p: dict[str, Any], nomes: dict[int, str], icones: dict[int, str]) -> str:
+    """Bloco completo de um jogador. Usa os dados já guardados pelo /aovivo."""
+    puuid = p["puuid"]
+    cid = int(p.get("championId", 0))
+    nome_atual = nomes.get(cid, f"Campeão {cid}")
+    ranques, maestrias, jogos = await asyncio.gather(
+        ranques_conta(puuid), maestrias_conta(puuid), jogos_recentes(puuid)
+    )
+    linhas = [f"{icones.get(cid, '')} Jogando de **{nome_atual}**".strip()]
+    linhas.extend(linhas_ranque(ranques))
+
+    atual = next((m for m in maestrias if int(m.get("championId", 0)) == cid), None)
+    if atual:
+        ultima = int(atual.get("lastPlayTime") or 0) // 1000
+        posicao = next(
+            (i for i, m in enumerate(maestrias, 1) if int(m.get("championId", 0)) == cid), 0
+        )
+        linhas.append(
+            f"⭐ {nome_atual}: maestria {atual.get('championLevel', 0)} • "
+            f"{_pontos(atual.get('championPoints'))} pts • {posicao}º da conta"
+            + (f" • jogou <t:{ultima}:R>" if ultima else "")
+        )
+    else:
+        linhas.append(f"⭐ {nome_atual}: primeira vez (sem maestria)")
+    if maestrias:
+        top = " • ".join(
+            f"{i}. {nomes.get(int(m.get('championId', 0)), '?')} ({_pontos(m.get('championPoints'))})"
+            for i, m in enumerate(maestrias[:3], 1)
+        )
+        linhas.append(f"👑 Top maestria: {top}")
+
+    if not jogos:
+        linhas.append("📈 Sem partidas recentes")
+        return "\n".join(linhas)
+    v = sum(1 for j in jogos if j["vitoria"])
+    linhas.append(
+        f"📈 Últimas {len(jogos)}: **{v}V {len(jogos) - v}D** ({_porcentagem(v, len(jogos))}%) "
+        + "".join("✅" if j["vitoria"] else "❌" for j in jogos)
+    )
+    com = [j for j in jogos if j["campeao_id"] == cid]
+    if com:
+        vc = sum(1 for j in com if j["vitoria"])
+        linhas.append(
+            f"🎯 Com {nome_atual}: {len(com)} de {len(jogos)} • {vc}V {len(com) - vc}D "
+            f"({_porcentagem(vc, len(com))}%)"
+            + (" • 🔥 jogando muito com ele" if len(com) >= 3 else "")
+        )
+    else:
+        linhas.append(f"🎯 Não jogou de {nome_atual} nas últimas {len(jogos)}")
+    contagem: dict[int, list[int]] = {}
+    for j in jogos:
+        contagem.setdefault(j["campeao_id"], [0, 0])
+        contagem[j["campeao_id"]][0] += 1
+        contagem[j["campeao_id"]][1] += int(j["vitoria"])
+    ranking = sorted(contagem.items(), key=lambda item: (-item[1][0], -item[1][1]))[:3]
+    linhas.append("🔁 Mais jogados: " + " • ".join(
+        f"{nomes.get(c, f'Campeão {c}')} {q}j ({w}V {q - w}D)" for c, (q, w) in ranking
+    ))
+    partidas = []
+    for j in jogos:
+        modo = await nome_fila_lol({"gameQueueConfigId": j.get("fila") or 0})
+        rota = NOMES_ROTA.get(j.get("rota", ""), "")
+        quando = f" <t:{j['fim']}:R>" if j.get("fim") else ""
+        partidas.append(
+            f"{'✅' if j['vitoria'] else '❌'} {nomes.get(j['campeao_id'], j.get('campeao') or '?')}"
+            f" • {modo}{' • ' + rota if rota else ''}{quando}"
+        )
+    linhas.append("🗂️ Partidas:\n" + "\n".join(partidas))
+    return "\n".join(linhas)
+
+
+async def montar_detalhes(jogo: dict[str, Any], puuid_ref: str) -> list[discord.Embed]:
+    """Um embed por time com todos os detalhes (enviados em mensagens separadas)."""
+    participantes = list(jogo.get("participants", []))[:10]
+    nomes = await nomes_campeoes()
+    icones = await icones_campeoes({int(p.get("championId", 0)) for p in participantes})
+
+    async def bloco(p: dict[str, Any]) -> str:
+        if not p.get("puuid") or p.get("bot"):
+            return "🤖 Bot"
+        try:
+            return await detalhes_jogador(p, nomes, icones)
+        except ErroRiot as exc:
+            return f"⚠️ {exc}"
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, KeyError) as exc:
+            log.warning("Ao vivo: falha nos detalhes: %s", exc)
+            return "⚠️ Não consegui falar com a Riot agora."
+
+    blocos = await asyncio.gather(*(bloco(p) for p in participantes))
+    time_ref = next((p.get("teamId") for p in participantes if p.get("puuid") == puuid_ref), 100)
+    embeds = []
+    for time_id in sorted({p.get("teamId") for p in participantes}, key=lambda t: t != time_ref):
+        emoji, titulo, cor = NOMES_TIME_LOL.get(time_id, ("⚪", f"Time {time_id}", 0x99AAB5))
+        embed = discord.Embed(title=f"📊 {emoji} {titulo} | detalhes completos", color=cor)
+        for p, texto in zip(participantes, blocos):
+            if p.get("teamId") == time_id:
+                embed.add_field(
+                    name=discord.utils.escape_markdown(p.get("riotId") or "Jogador")[:256],
+                    value=texto[:1024], inline=False,
+                )
+        embed.set_footer(text=f"Últimas {AOVIVO_PARTIDAS_DESEMPENHO} partidas de cada jogador.")
+        caber_no_discord([embed])
+        embeds.append(embed)
+    return embeds
+
+
+class DetalhesAoVivoView(discord.ui.View):
+    """Botão '📊 Detalhes completos': mostra tudo, só para quem clicou."""
+
+    def __init__(self, jogo: dict[str, Any], puuid_ref: str) -> None:
+        super().__init__(timeout=3 * 3600)
+        self.jogo = jogo
+        self.puuid_ref = puuid_ref
+        self.trava = asyncio.Lock()
+        self.pronto: tuple[float, list[discord.Embed]] | None = None
+
+    @discord.ui.button(label="Detalhes completos", emoji="📊", style=discord.ButtonStyle.primary)
+    async def detalhes(self, inter: discord.Interaction, botao: discord.ui.Button) -> None:
+        await inter.response.defer(ephemeral=True, thinking=True)
+        async with self.trava:
+            if self.pronto is None or time.time() - self.pronto[0] > ESTATISTICAS_VALIDADE_SEGUNDOS:
+                self.pronto = (time.time(), await montar_detalhes(self.jogo, self.puuid_ref))
+        # Um time por mensagem para caber no limite de tamanho do Discord.
+        for embed in self.pronto[1]:
+            await inter.followup.send(
+                embed=embed, ephemeral=True, allowed_mentions=discord.AllowedMentions.none()
+            )
 
 
 @bot.tree.command(
@@ -4206,6 +4372,7 @@ async def aovivo(
             mensagem = await inter.followup.send(
                 content=f"🎮 **{discord.utils.escape_markdown(c.get('riot_id', ''))}** está em partida:",
                 embeds=embeds[:10], ephemeral=True, wait=True,
+                view=DetalhesAoVivoView(jogo, c["puuid"]),
                 allowed_mentions=discord.AllowedMentions.none(),
             )
             try:
@@ -4370,6 +4537,7 @@ async def vigiar_partidas_aovivo() -> None:
                     verbo = "entraram" if len({u for u, _p, _j in membros}) > 1 else "entrou"
                     mensagem_aviso = await canal.send(
                         content=f"🎮 {quem} {verbo} em partida!", embeds=embeds[:10],
+                        view=DetalhesAoVivoView(jogo, puuid_ref),
                         allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
                     )
                     asyncio.create_task(completar_aviso(mensagem_aviso, jogo, puuid_ref))
