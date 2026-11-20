@@ -3779,35 +3779,73 @@ async def ranques_conta(puuid: str) -> list[Any]:
     return dados
 
 
-async def maestria_no_campeao(puuid: str, campeao_id: int) -> dict[str, Any] | None:
+_aovivo_maestrias: dict[str, tuple[float, list[dict[str, Any]]]] = {}
+
+
+async def maestrias_conta(puuid: str) -> list[dict[str, Any]]:
+    """Todas as maestrias da conta (1 consulta), da maior para a menor."""
+    guardado = _aovivo_maestrias.get(puuid)
+    if guardado and time.time() - guardado[0] < ELO_VALIDADE_SEGUNDOS:
+        return guardado[1]
     try:
         dados = await chamar_riot(
             f"https://{RIOT_PLATAFORMA}.api.riotgames.com/lol/champion-mastery/v4/"
-            f"champion-masteries/by-puuid/{quote(puuid, safe='')}/by-champion/{campeao_id}"
+            f"champion-masteries/by-puuid/{quote(puuid, safe='')}"
         )
     except ErroRiot as exc:
-        if exc.status == 404:
-            return None
-        raise
-    return dados if isinstance(dados, dict) else None
+        if exc.status != 404:
+            raise
+        dados = []
+    lista = [m for m in dados if isinstance(m, dict)] if isinstance(dados, list) else []
+    lista.sort(key=lambda m: -int(m.get("championPoints", 0) or 0))
+    _aovivo_maestrias[puuid] = (time.time(), lista)
+    while len(_aovivo_maestrias) > 2000:
+        _aovivo_maestrias.pop(next(iter(_aovivo_maestrias)))
+    return lista
 
 
-_aovivo_historico: dict[str, tuple[float, set[str]]] = {}
-AOVIVO_HISTORICO_PARTIDAS = 10   # Partidas recentes comparadas para achar quem joga junto.
+def _pontos(valor: Any) -> str:
+    return f"{int(valor or 0):,}".replace(",", ".")
+
+
+_aovivo_historico: dict[str, tuple[float, list[str]]] = {}
+AOVIVO_HISTORICO_PARTIDAS = 20   # Partidas recentes comparadas para achar quem joga junto.
 AOVIVO_MINIMO_JUNTOS = 2         # Partidas em comum para considerar que estão em grupo.
 EMOJIS_GRUPO = ("🟦", "🟩", "🟨", "🟪", "🟧")
 
 
 async def partidas_recentes_ids(puuid: str) -> set[str]:
     """IDs das últimas partidas (só os IDs: 1 consulta por jogador)."""
+    return set(await partidas_recentes_lista(puuid))
+
+
+_aovivo_em_andamento: dict[str, asyncio.Task] = {}
+
+
+async def em_andamento(chave: str, criar) -> Any:
+    """Se a mesma consulta já está sendo feita, espera por ela em vez de repetir."""
+    tarefa = _aovivo_em_andamento.get(chave)
+    if tarefa is None:
+        tarefa = asyncio.ensure_future(criar())
+        _aovivo_em_andamento[chave] = tarefa
+        tarefa.add_done_callback(lambda _t: _aovivo_em_andamento.pop(chave, None))
+    return await asyncio.shield(tarefa)
+
+
+async def partidas_recentes_lista(puuid: str) -> list[str]:
+    """Mesmo que acima, da partida mais nova para a mais antiga."""
     guardado = _aovivo_historico.get(puuid)
     if guardado and time.time() - guardado[0] < ESTATISTICAS_VALIDADE_SEGUNDOS:
         return guardado[1]
+    return await em_andamento(f"ids:{puuid}", lambda: _buscar_partidas_recentes(puuid))
+
+
+async def _buscar_partidas_recentes(puuid: str) -> list[str]:
     dados = await chamar_riot(
         f"https://{RIOT_REGIAO}.api.riotgames.com/lol/match/v5/matches/by-puuid/"
         f"{quote(puuid, safe='')}/ids?start=0&count={AOVIVO_HISTORICO_PARTIDAS}"
     )
-    ids = {str(i) for i in dados} if isinstance(dados, list) else set()
+    ids = [str(i) for i in dados] if isinstance(dados, list) else []
     _aovivo_historico[puuid] = (time.time(), ids)
     while len(_aovivo_historico) > 2000:
         _aovivo_historico.pop(next(iter(_aovivo_historico)))
@@ -3836,10 +3874,13 @@ def grupos_provaveis(
             if participantes[i].get("teamId") != participantes[j].get("teamId"):
                 continue
             a, b = historicos[i], historicos[j]
-            if not a or not b:
-                continue
-            comuns = len(a & b)
-            if comuns >= AOVIVO_MINIMO_JUNTOS:
+            comuns = len(a & b) if a and b else 0
+            # Dois membros vinculados do servidor no mesmo time contam como grupo.
+            ambos_do_servidor = all(
+                participantes[k].get("puuid") and dono_da_conta_riot(participantes[k]["puuid"])
+                for k in (i, j)
+            )
+            if comuns >= AOVIVO_MINIMO_JUNTOS or ambos_do_servidor:
                 pai[raiz(i)] = raiz(j)
                 juntos_max[i] = max(juntos_max[i], comuns)
                 juntos_max[j] = max(juntos_max[j], comuns)
@@ -3855,6 +3896,53 @@ def grupos_provaveis(
             resultado[i] = (numero, juntos_max[i])
         numero += 1
     return resultado
+
+
+_filas_riot: dict[int, str] = {}
+# Nomes em português para filas que não estão em NOMES_FILAS_LOL.
+TRADUCOES_FILA = (
+    ("mayhem", "ARAM: Desordem"),
+    ("aram", "ARAM"),
+    ("arena", "Arena"),
+    ("swiftplay", "Escolha Rápida"),
+    ("urf", "URF"),
+    ("one for all", "Um Por Todos"),
+    ("nexus blitz", "Nexus Blitz"),
+    ("ultimate spellbook", "Grimório Supremo"),
+    ("brawl", "Confronto"),
+    ("tutorial", "Tutorial"),
+    ("co-op", "Cooperativo vs. IA"),
+    ("bot", "Cooperativo vs. IA"),
+)
+
+
+async def nome_fila_lol(jogo: dict[str, Any]) -> str:
+    """Nome do modo: lista do bot, depois a lista oficial de filas da Riot."""
+    fila_id = int(jogo.get("gameQueueConfigId") or 0)
+    if fila_id in NOMES_FILAS_LOL:
+        return NOMES_FILAS_LOL[fila_id]
+    if fila_id == 0 or jogo.get("gameType") == "CUSTOM_GAME":
+        return "Personalizada"
+    if not _filas_riot:
+        timeout = aiohttp.ClientTimeout(total=8, connect=4)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as sessao:
+                async with sessao.get(
+                    "https://static.developer.riotgames.com/docs/lol/queues.json"
+                ) as r:
+                    for fila in await r.json(content_type=None):
+                        _filas_riot[int(fila["queueId"])] = str(fila.get("description") or "")
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, KeyError, TypeError) as exc:
+            log.warning("Não consegui carregar a lista de filas da Riot: %s", exc)
+    descricao = (_filas_riot.get(fila_id) or "").strip()
+    texto = f"{descricao} {jogo.get('gameMode') or ''}".casefold()
+    for chave, nome in TRADUCOES_FILA:
+        if chave in texto:
+            return nome
+    if descricao:
+        return descricao.removesuffix(" games").strip()
+    log.info("Fila desconhecida: id=%s modo=%s", fila_id, jogo.get("gameMode"))
+    return f"Outro modo ({fila_id})"
 
 
 def linhas_ranque(entradas: list[Any]) -> list[str]:
@@ -3882,26 +3970,27 @@ def dono_da_conta_riot(puuid: str) -> int | None:
     return None
 
 
-async def montar_aovivo(jogo: dict[str, Any], puuid_ref: str) -> list[discord.Embed]:
-    """Um embed por time, com elo, maestria e feitiços de cada jogador."""
+async def montar_aovivo(
+    jogo: dict[str, Any], puuid_ref: str, com_desempenho: bool = True
+) -> list[discord.Embed]:
+    """Um embed por time. Sem desempenho fica pronto em poucos segundos."""
     participantes = list(jogo.get("participants", []))[:10]
     nomes = await nomes_campeoes()
     feiticos = await nomes_feiticos()
     icones = await icones_campeoes({int(p.get("championId", 0)) for p in participantes})
+    nomes = dict(nomes)
 
-    async def dados_jogador(p: dict[str, Any]) -> tuple[list[Any] | None, dict[str, Any] | None]:
+    async def dados_jogador(p: dict[str, Any]) -> tuple[list[Any] | None, list[dict[str, Any]] | None]:
         puuid = p.get("puuid")
         if not puuid or p.get("bot"):
             return None, None
         try:
             return await asyncio.gather(
-                ranques_conta(puuid), maestria_no_campeao(puuid, int(p.get("championId", 0)))
+                ranques_conta(puuid), maestrias_conta(puuid)
             )
         except (ErroRiot, aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
             log.warning("Ao vivo: falha ao consultar jogador: %s", exc)
             return None, None
-
-    infos = await asyncio.gather(*(dados_jogador(p) for p in participantes))
 
     async def historico(p: dict[str, Any]) -> set[str] | None:
         if not p.get("puuid") or p.get("bot"):
@@ -3912,7 +4001,23 @@ async def montar_aovivo(jogo: dict[str, Any], puuid_ref: str) -> list[discord.Em
             log.warning("Ao vivo: falha no histórico: %s", exc)
             return None
 
-    historicos = await asyncio.gather(*(historico(p) for p in participantes))
+    async def desempenho(p: dict[str, Any]) -> str | None:
+        if not p.get("puuid") or p.get("bot"):
+            return None
+        try:
+            return await texto_desempenho(p["puuid"], int(p.get("championId", 0)), nomes)
+        except (ErroRiot, aiohttp.ClientError, asyncio.TimeoutError, ValueError, KeyError) as exc:
+            log.warning("Ao vivo: falha no desempenho: %s", exc)
+            return "📈 Desempenho recente indisponível"
+
+    async def nada() -> None:
+        return None
+
+    infos, historicos, desempenhos = await asyncio.gather(
+        asyncio.gather(*(dados_jogador(p) for p in participantes)),
+        asyncio.gather(*(historico(p) for p in participantes)),
+        asyncio.gather(*(desempenho(p) if com_desempenho else nada() for p in participantes)),
+    )
     grupos = grupos_provaveis(participantes, list(historicos))
     time_ref = next(
         (p.get("teamId") for p in participantes if p.get("puuid") == puuid_ref), 100
@@ -3923,7 +4028,7 @@ async def montar_aovivo(jogo: dict[str, Any], puuid_ref: str) -> list[discord.Em
     for time_id in times:
         emoji, titulo, cor = NOMES_TIME_LOL.get(time_id, ("⚪", f"Time {time_id}", 0x99AAB5))
         embed = discord.Embed(title=f"{emoji} {titulo}", color=cor)
-        for indice, (p, (ranques, maestria)) in enumerate(zip(participantes, infos)):
+        for indice, (p, (ranques, maestrias)) in enumerate(zip(participantes, infos)):
             if p.get("teamId") != time_id:
                 continue
             cid = int(p.get("championId", 0))
@@ -3944,17 +4049,38 @@ async def montar_aovivo(jogo: dict[str, Any], puuid_ref: str) -> list[discord.Em
                 linhas.append(
                     f"{EMOJIS_GRUPO[numero_grupo % len(EMOJIS_GRUPO)]} Jogando junto com "
                     f"{discord.utils.escape_markdown(', '.join(companheiros))[:200]} "
-                    f"({vezes} das últimas {AOVIVO_HISTORICO_PARTIDAS})"
+                    + (f"({vezes} das últimas {AOVIVO_HISTORICO_PARTIDAS})"
+                       if vezes >= AOVIVO_MINIMO_JUNTOS else "(membros do servidor)")
                 )
             if p.get("bot"):
                 linhas.append("🤖 Bot")
             else:
                 linhas.extend(linhas_ranque(ranques) if ranques is not None else ["🏅 Elo indisponível"])
-                if maestria:
-                    pontos = f"{int(maestria.get('championPoints', 0)):,}".replace(",", ".")
-                    linhas.append(f"⭐ Maestria {maestria.get('championLevel', 0)} • {pontos} pts")
-                elif ranques is not None:
-                    linhas.append("⭐ Sem maestria nesse campeão")
+                if maestrias is not None:
+                    atual = next(
+                        (m for m in maestrias if int(m.get("championId", 0)) == cid), None
+                    )
+                    if atual:
+                        ultima = int(atual.get("lastPlayTime") or 0) // 1000
+                        linhas.append(
+                            f"⭐ Maestria {atual.get('championLevel', 0)} • "
+                            f"{_pontos(atual.get('championPoints'))} pts"
+                            + (f" • jogou <t:{ultima}:R>" if ultima else "")
+                        )
+                    else:
+                        linhas.append("⭐ Primeira vez (sem maestria nesse campeão)")
+                    if maestrias:
+                        principal = maestrias[0]
+                        pid = int(principal.get("championId", 0))
+                        if pid == cid:
+                            linhas.append("👑 Esse é o campeão principal dele")
+                        else:
+                            linhas.append(
+                                f"👑 Principal: {nomes.get(pid, f'Campeão {pid}')} "
+                                f"({_pontos(principal.get('championPoints'))} pts)"
+                            )
+            if desempenhos[indice]:
+                linhas.append(desempenhos[indice])
             nomes_f = [feiticos.get(int(p.get(k) or 0)) for k in ("spell1Id", "spell2Id")]
             if any(nomes_f):
                 linhas.append("✨ " + " / ".join(n for n in nomes_f if n))
@@ -3970,17 +4096,68 @@ async def montar_aovivo(jogo: dict[str, Any], puuid_ref: str) -> list[discord.Em
             embed.add_field(name="🚫 Banimentos", value=", ".join(banidos)[:1024], inline=False)
         embeds.append(embed)
 
-    fila_id = int(jogo.get("gameQueueConfigId") or 0)
-    fila = NOMES_FILAS_LOL.get(fila_id, "Personalizada" if fila_id == 0 else "Outro modo")
+    fila = await nome_fila_lol(jogo)
     minutos = max(0, int(jogo.get("gameLength") or 0)) // 60
     if embeds:
         embeds[0].description = f"🎮 **{fila}** • {minutos} min de jogo"
+        if not com_desempenho:
+            embeds[0].description += "\n⏳ Carregando vitórias e derrotas recentes..."
         if grupos:
             embeds[0].description += (
                 "\n-# Grupos são estimados pelas partidas recentes em comum; a Riot não informa isso."
             )
         embeds[-1].set_footer(text=AVISO_RIOT[:2048])
     return embeds
+
+
+AOVIVO_PARTIDAS_DESEMPENHO = 5  # Partidas recentes abertas por jogador.
+
+
+async def texto_desempenho(puuid: str, cid: int, nomes: dict[int, str]) -> str:
+    """Vitórias/derrotas recentes, desempenho com o campeão atual e o mais jogado."""
+    jogos = []
+    ids = (await partidas_recentes_lista(puuid))[:AOVIVO_PARTIDAS_DESEMPENHO]
+    resumos = await asyncio.gather(
+        *(em_andamento(f"partida:{m}", lambda m=m: resumo_partida_lol(m)) for m in ids),
+        return_exceptions=True,
+    )
+    for resumo in resumos:
+        if isinstance(resumo, ErroRiot):
+            if resumo.status in (0, 401, 403, 429):
+                raise resumo
+            continue
+        if isinstance(resumo, BaseException) or not resumo:
+            continue
+        eu = next((x for x in resumo["participantes"] if x["puuid"] == puuid), None)
+        if eu:
+            jogos.append(eu)
+    if not jogos:
+        return "📈 Sem partidas recentes"
+    v = sum(1 for j in jogos if j["vitoria"])
+    d = len(jogos) - v
+    linhas = [f"📈 Últimas {len(jogos)}: **{v}V {d}D** ({_porcentagem(v, len(jogos))}%)"]
+    com = [j for j in jogos if j["campeao_id"] == cid]
+    if com:
+        vc = sum(1 for j in com if j["vitoria"])
+        frequente = " • 🔥 jogando muito com ele" if len(com) >= 3 else ""
+        linhas.append(
+            f"🎯 Com ele: {len(com)} de {len(jogos)} • {vc}V {len(com) - vc}D "
+            f"({_porcentagem(vc, len(com))}%){frequente}"
+        )
+    else:
+        linhas.append(f"🎯 Não jogou com ele nas últimas {len(jogos)}")
+    contagem: dict[int, list[int]] = {}
+    for j in jogos:
+        contagem.setdefault(j["campeao_id"], [0, 0])
+        contagem[j["campeao_id"]][0] += 1
+        contagem[j["campeao_id"]][1] += int(j["vitoria"])
+    mais_id, (qtd, vit) = max(contagem.items(), key=lambda item: (item[1][0], item[1][1]))
+    if qtd >= 2 and mais_id != cid:
+        linhas.append(
+            f"🔁 Mais jogado: {nomes.get(mais_id, f'Campeão {mais_id}')} • {qtd} jogos • "
+            f"{vit}V {qtd - vit}D"
+        )
+    return "\n".join(linhas)
 
 
 @bot.tree.command(
@@ -4025,12 +4202,18 @@ async def aovivo(
             await inter.followup.send("⚠️ Não consegui falar com a Riot agora.", ephemeral=True)
             return
         if jogo:
-            embeds = await montar_aovivo(jogo, c["puuid"])
-            await inter.followup.send(
+            embeds = await montar_aovivo(jogo, c["puuid"], com_desempenho=False)
+            mensagem = await inter.followup.send(
                 content=f"🎮 **{discord.utils.escape_markdown(c.get('riot_id', ''))}** está em partida:",
-                embeds=embeds[:10], ephemeral=True,
+                embeds=embeds[:10], ephemeral=True, wait=True,
                 allowed_mentions=discord.AllowedMentions.none(),
             )
+            try:
+                completo = await montar_aovivo(jogo, c["puuid"])
+                await mensagem.edit(embeds=completo[:10])
+            except (discord.HTTPException, ErroRiot, aiohttp.ClientError,
+                    asyncio.TimeoutError, ValueError) as exc:
+                log.warning("Ao vivo: não consegui completar o desempenho: %s", exc)
             return
     await inter.followup.send(
         f"💤 {alvo.mention} não está em partida agora. "
@@ -4114,6 +4297,16 @@ async def aovivo_avisos(inter: discord.Interaction, avisos: app_commands.Choice[
     )
 
 
+async def completar_aviso(mensagem: discord.Message, jogo: dict[str, Any], puuid_ref: str) -> None:
+    """Acrescenta o desempenho recente ao aviso já publicado."""
+    try:
+        completo = await montar_aovivo(jogo, puuid_ref)
+        await mensagem.edit(embeds=completo[:10])
+    except (discord.HTTPException, ErroRiot, aiohttp.ClientError,
+            asyncio.TimeoutError, ValueError, KeyError) as exc:
+        log.warning("Ao vivo: não consegui completar o aviso: %s", exc)
+
+
 @tasks.loop(seconds=10)
 async def vigiar_partidas_aovivo() -> None:
     global _aovivo_proxima
@@ -4172,13 +4365,14 @@ async def vigiar_partidas_aovivo() -> None:
                 _aovivo_anunciados[(guild.id, game_id)] = agora
                 try:
                     _uid, puuid_ref, jogo = membros[0]
-                    embeds = await montar_aovivo(jogo, puuid_ref)
+                    embeds = await montar_aovivo(jogo, puuid_ref, com_desempenho=False)
                     quem = ", ".join(dict.fromkeys(f"<@{u}>" for u, _p, _j in membros))
                     verbo = "entraram" if len({u for u, _p, _j in membros}) > 1 else "entrou"
-                    await canal.send(
+                    mensagem_aviso = await canal.send(
                         content=f"🎮 {quem} {verbo} em partida!", embeds=embeds[:10],
                         allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
                     )
+                    asyncio.create_task(completar_aviso(mensagem_aviso, jogo, puuid_ref))
                 except (discord.HTTPException, ErroRiot, aiohttp.ClientError,
                         asyncio.TimeoutError, ValueError, KeyError) as exc:
                     log.warning("Ao vivo: não consegui anunciar a partida: %s", exc)
