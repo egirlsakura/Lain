@@ -4576,6 +4576,7 @@ async def on_connect() -> None:
         vigiar_partidas_aovivo.start()
     if not vigiar_personalizadas.is_running():
         vigiar_personalizadas.start()
+    iniciar_recursos_extras()
     # Botões de vencedor continuam funcionando depois de reiniciar o bot.
     for chave, partida in list(partidas.items()):
         botoes = partida.get("lol_botoes_msg")
@@ -4651,10 +4652,12 @@ class BotoesVencedorView(discord.ui.View):
                         pass
                     return
                 varias = len(partidas_do_servidor(guild.id)) > 1
-                ja = int(partidas[self.chave].get("lol_devolvidos") or 0)
+                partida_atual = partidas[self.chave]
+                ja = int(partida_atual.get("lol_devolvidos") or 0)
                 mensagem = _somar_devolvidos(await encerrar_partida(guild, self.chave, vencedor), ja)
             try:
-                await inter.message.edit(content=_texto_final(guild, mensagem, varias), view=None,
+                await inter.message.edit(content=_texto_final(guild, mensagem, varias),
+                                         view=view_revanche(partida_atual),
                                          allowed_mentions=discord.AllowedMentions.none())
             except (discord.HTTPException, AttributeError):
                 await inter.followup.send(_texto_final(guild, mensagem, varias),
@@ -4841,16 +4844,17 @@ async def finalizar_com_vencedor(
         mensagem = _texto_final(
             guild, _somar_devolvidos(await encerrar_partida(guild, chave, vencedor), ja), varias
         )
+    revanche = view_revanche(partida)
     if botoes:
         try:
             await guild.get_channel(botoes[0]).get_partial_message(botoes[1]).edit(
-                content=mensagem, view=None, allowed_mentions=discord.AllowedMentions.none()
+                content=mensagem, view=revanche, allowed_mentions=discord.AllowedMentions.none()
             )
             return True
         except (discord.HTTPException, AttributeError):
             pass
     if canal:
-        await canal.send(mensagem, allowed_mentions=discord.AllowedMentions.none())
+        await canal.send(mensagem, view=revanche, allowed_mentions=discord.AllowedMentions.none())
     return True
 
 
@@ -5210,6 +5214,2308 @@ async def on_message(message: discord.Message) -> None:
             await message.channel.send(aviso, allowed_mentions=discord.AllowedMentions.none())
         except discord.HTTPException:
             pass
+
+
+# =====================================================================
+# ===================== AVISOS: CANAL/TÓPICO + MENSAGEM =================
+# =====================================================================
+# Cada recurso (atualização, rotação, status, quiz, perfil) tem um destino
+# (canal de texto ou tópico) e uma mensagem personalizada opcional, que pode
+# ter cargos (@cargo), emojis (inclusive animados) e quebras de linha (\n).
+import copy
+import io
+import random
+
+ARQUIVO_AVISOS = Path("/data/avisos.json")
+TIPOS_AVISO = {
+    "patch": "📋 Notas da atualização",
+    "rotacao": "🔄 Rotação grátis",
+    "status": "🛠️ Status dos servidores",
+    "quiz": "🃏 Quiz automático",
+    "perfil": "📊 Cartões de perfil",
+}
+VARIAVEIS_AVISO = {
+    "patch": "{versao}",
+    "rotacao": "{data}",
+    "status": "{titulo}",
+    "quiz": "",
+    "perfil": "{membro}",
+}
+
+
+def _carregar_json(arquivo: Path, padrao: Any) -> Any:
+    if not arquivo.exists():
+        return padrao
+    try:
+        return json.loads(arquivo.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        raise SystemExit(f"Erro ao ler {arquivo.name}: {exc}") from exc
+
+
+def _salvar_json(arquivo: Path, dados: Any) -> None:
+    arquivo.parent.mkdir(parents=True, exist_ok=True)
+    temporario = arquivo.with_suffix(".json.tmp")
+    temporario.write_text(json.dumps(dados, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporario.replace(arquivo)
+
+
+avisos: dict[str, Any] = _carregar_json(ARQUIVO_AVISOS, {})
+
+
+def config_aviso(guild_id: int, tipo: str) -> dict[str, Any] | None:
+    return (avisos.get(str(guild_id)) or {}).get(tipo)
+
+
+def destino_aviso(guild: discord.Guild, tipo: str) -> discord.TextChannel | discord.Thread | None:
+    cfg = config_aviso(guild.id, tipo)
+    if not cfg:
+        return None
+    canal = guild.get_channel_or_thread(int(cfg.get("destino") or 0))
+    return canal if isinstance(canal, (discord.TextChannel, discord.Thread)) else None
+
+
+def mensagem_aviso(guild_id: int, tipo: str, **valores: str) -> str | None:
+    cfg = config_aviso(guild_id, tipo) or {}
+    texto = str(cfg.get("mensagem") or "").replace("\\n", "\n")
+    for chave, valor in valores.items():
+        texto = texto.replace("{" + chave + "}", str(valor))
+    return texto[:2000] or None
+
+
+MENCOES_AVISO = discord.AllowedMentions(everyone=True, roles=True, users=True)
+
+
+async def enviar_aviso(
+    guild: discord.Guild, tipo: str, *, embeds: list[discord.Embed] | None = None,
+    arquivo: discord.File | None = None, view: discord.ui.View | None = None, **valores: str,
+) -> discord.Message | None:
+    destino = destino_aviso(guild, tipo)
+    if destino is None:
+        return None
+    kwargs: dict[str, Any] = {"content": mensagem_aviso(guild.id, tipo, **valores),
+                              "allowed_mentions": MENCOES_AVISO}
+    if embeds:
+        kwargs["embeds"] = embeds[:10]
+    if arquivo:
+        kwargs["file"] = arquivo
+    if view:
+        kwargs["view"] = view
+    try:
+        return await destino.send(**kwargs)
+    except discord.HTTPException as exc:
+        log.warning("Aviso %s: não consegui postar em %s: %s", tipo, destino.id, exc)
+        return None
+
+
+async def _pode_configurar(inter: discord.Interaction) -> bool:
+    return inter.guild is not None and (autorizado(inter) or await pode_gerenciar_contas(inter))
+
+
+grupo_avisos = app_commands.Group(
+    name="avisos", description="Onde e como o bot posta atualizações, rotação, status, quiz e perfis",
+    guild_only=True,
+)
+ESCOLHAS_AVISO = [app_commands.Choice(name=nome, value=chave) for chave, nome in TIPOS_AVISO.items()]
+
+
+@grupo_avisos.command(name="configurar", description="Escolhe o canal ou tópico e a mensagem de um aviso")
+@app_commands.describe(
+    tipo="Qual aviso configurar",
+    destino="Canal de texto ou tópico onde o bot vai postar",
+    mensagem="Opcional: texto junto do aviso. Aceita @cargos, emojis animados e \\n para pular linha",
+    intervalo_horas="Só para o quiz automático: de quantas em quantas horas (padrão 6)",
+)
+@app_commands.choices(tipo=ESCOLHAS_AVISO)
+async def avisos_configurar(
+    inter: discord.Interaction, tipo: app_commands.Choice[str],
+    destino: discord.TextChannel | discord.Thread,
+    mensagem: Optional[str] = None,
+    intervalo_horas: Optional[app_commands.Range[int, 1, 168]] = None,
+) -> None:
+    if not await _pode_configurar(inter):
+        await inter.response.send_message("🔒 Só quem tem **Gerenciar Canais**, o dono ou o cargo autorizado.", ephemeral=True)
+        return
+    perm = destino.permissions_for(inter.guild.me)
+    pode_enviar = perm.send_messages_in_threads if isinstance(destino, discord.Thread) else perm.send_messages
+    faltando = [nome for nome, ok in (("Enviar mensagens", pode_enviar), ("Inserir links", perm.embed_links),
+                                      ("Anexar arquivos", perm.attach_files)) if not ok]
+    if faltando:
+        await inter.response.send_message(
+            f"⚠️ Preciso de **{', '.join(faltando)}** em {destino.mention}.", ephemeral=True
+        )
+        return
+    cfg = avisos.setdefault(str(inter.guild.id), {}).setdefault(tipo.value, {})
+    cfg["destino"] = destino.id
+    if mensagem is not None:
+        cfg["mensagem"] = mensagem.strip()
+    if tipo.value == "quiz":
+        cfg["intervalo"] = int(intervalo_horas or cfg.get("intervalo") or 6)
+        cfg.setdefault("proximo", time.time() + cfg["intervalo"] * 3600)
+    _salvar_json(ARQUIVO_AVISOS, avisos)
+    aviso_cargo = ""
+    if mensagem and "<@&" in mensagem and not perm.mention_everyone:
+        aviso_cargo = ("\n-# Para marcar cargos que não são mencionáveis, dê ao bot a permissão "
+                       "**Mencionar @everyone, @here e todos os cargos**.")
+    extra = f"\n⏱️ A cada **{cfg['intervalo']}h**." if tipo.value == "quiz" else ""
+    variavel = VARIAVEIS_AVISO.get(tipo.value)
+    dica = f"\n-# Na mensagem, você pode usar `{variavel}`." if variavel else ""
+    await inter.response.send_message(
+        f"✅ **{tipo.name}** em {destino.mention}.{extra}\n"
+        f"💬 Mensagem: {cfg.get('mensagem') or '*(nenhuma)*'}{dica}{aviso_cargo}\n"
+        f"Use `/avisos testar` para ver como fica.",
+        ephemeral=True, allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+@grupo_avisos.command(name="mensagem", description="Muda só a mensagem personalizada de um aviso")
+@app_commands.describe(tipo="Qual aviso", mensagem="Novo texto. Deixe vazio para tirar a mensagem")
+@app_commands.choices(tipo=ESCOLHAS_AVISO)
+async def avisos_mensagem(inter: discord.Interaction, tipo: app_commands.Choice[str], mensagem: Optional[str] = None) -> None:
+    if not await _pode_configurar(inter):
+        await inter.response.send_message("🔒 Sem permissão.", ephemeral=True)
+        return
+    cfg = config_aviso(inter.guild.id, tipo.value)
+    if not cfg:
+        await inter.response.send_message("Configure primeiro com `/avisos configurar`.", ephemeral=True)
+        return
+    cfg["mensagem"] = (mensagem or "").strip()
+    _salvar_json(ARQUIVO_AVISOS, avisos)
+    await inter.response.send_message(
+        f"💬 Mensagem de **{tipo.name}**: {cfg['mensagem'] or '*(nenhuma)*'}",
+        ephemeral=True, allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+@grupo_avisos.command(name="desligar", description="Desliga um aviso automático")
+@app_commands.choices(tipo=ESCOLHAS_AVISO)
+async def avisos_desligar(inter: discord.Interaction, tipo: app_commands.Choice[str]) -> None:
+    if not await _pode_configurar(inter):
+        await inter.response.send_message("🔒 Sem permissão.", ephemeral=True)
+        return
+    (avisos.get(str(inter.guild.id)) or {}).pop(tipo.value, None)
+    _salvar_json(ARQUIVO_AVISOS, avisos)
+    await inter.response.send_message(f"🔕 **{tipo.name}** desligado.", ephemeral=True)
+
+
+@grupo_avisos.command(name="ver", description="Mostra onde cada aviso está configurado")
+async def avisos_ver(inter: discord.Interaction) -> None:
+    linhas = []
+    for chave, nome in TIPOS_AVISO.items():
+        cfg = config_aviso(inter.guild.id, chave)
+        if not cfg:
+            linhas.append(f"{nome}: *desligado*")
+            continue
+        extra = f" • a cada {cfg.get('intervalo', 6)}h" if chave == "quiz" else ""
+        msg = f"\n  💬 {cfg['mensagem']}" if cfg.get("mensagem") else ""
+        linhas.append(f"{nome}: <#{cfg['destino']}>{extra}{msg}")
+    await inter.response.send_message("\n".join(linhas)[:2000], ephemeral=True,
+                                      allowed_mentions=discord.AllowedMentions.none())
+
+
+@grupo_avisos.command(name="testar", description="Posta um aviso agora no destino configurado")
+@app_commands.choices(tipo=ESCOLHAS_AVISO)
+async def avisos_testar(inter: discord.Interaction, tipo: app_commands.Choice[str]) -> None:
+    if not await _pode_configurar(inter):
+        await inter.response.send_message("🔒 Sem permissão.", ephemeral=True)
+        return
+    destino = destino_aviso(inter.guild, tipo.value)
+    if destino is None:
+        await inter.response.send_message("Configure primeiro com `/avisos configurar`.", ephemeral=True)
+        return
+    await inter.response.defer(ephemeral=True, thinking=True)
+    try:
+        if tipo.value == "patch":
+            versao, embeds = await montar_patch()
+            ok = await enviar_aviso(inter.guild, "patch", embeds=embeds, view=PatchSelecaoView(),
+                                    versao=".".join(nome_do_patch(versao)))
+        elif tipo.value == "rotacao":
+            ok = await enviar_aviso(inter.guild, "rotacao", embeds=[await montar_rotacao()],
+                                    data=time.strftime("%d/%m"))
+        elif tipo.value == "status":
+            embed = await montar_status_atual()
+            ok = await enviar_aviso(inter.guild, "status", embeds=[embed], titulo=embed.title or "")
+        elif tipo.value == "quiz":
+            ok = await iniciar_quiz(destino, mensagem_aviso(inter.guild.id, "quiz"))
+        else:
+            ok = await enviar_aviso(inter.guild, "perfil", embeds=[discord.Embed(
+                description="📊 Os cartões do `/perfil` vão aparecer aqui.", color=0xC8AA6E)],
+                membro=inter.user.mention)
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, KeyError, ErroRiot) as exc:
+        log.warning("Avisos testar %s: %s", tipo.value, exc)
+        ok = None
+    await inter.followup.send(f"✅ Enviado em {destino.mention}." if ok else "⚠️ Não consegui enviar agora.",
+                              ephemeral=True)
+
+
+bot.tree.add_command(grupo_avisos)
+
+
+# =====================================================================
+# ========================= /patch (só em português) ====================
+# =====================================================================
+PATCH_URL = "https://www.leagueoflegends.com/pt-br/news/game-updates/league-of-legends-patch-{ano}-{numero}-notes/"
+ROTULOS_ATRIBUTOS = {
+    "hp": "Vida", "hpperlevel": "Vida/nível", "mp": "Mana", "mpperlevel": "Mana/nível",
+    "armor": "Armadura", "armorperlevel": "Armadura/nível", "spellblock": "Resist. mágica",
+    "spellblockperlevel": "Resist. mágica/nível", "attackdamage": "Dano de ataque",
+    "attackdamageperlevel": "Dano de ataque/nível", "attackspeed": "Vel. de ataque",
+    "attackspeedperlevel": "Vel. de ataque/nível", "movespeed": "Vel. de movimento",
+    "attackrange": "Alcance", "hpregen": "Regen. de vida", "mpregen": "Regen. de mana",
+}
+_patch_cache: dict[str, list[discord.Embed]] = {}
+_ddragon_cache: dict[str, Any] = {}
+
+
+def nome_do_patch(versao: str) -> tuple[str, str]:
+    """Versão do Data Dragon '16.23.1' -> ('26', '23'), o nome que a Riot usa (26.23)."""
+    partes = versao.split(".")
+    return str(int(partes[0]) + 10), str(int(partes[1]))
+
+
+async def _baixar(url: str, json_: bool = True, binario: bool = False) -> Any:
+    timeout = aiohttp.ClientTimeout(total=40, connect=8)
+    cabecalhos = {"User-Agent": "Mozilla/5.0 (bot de Discord privado)"}
+    async with aiohttp.ClientSession(timeout=timeout, headers=cabecalhos) as sessao:
+        async with sessao.get(url) as r:
+            if r.status != 200:
+                raise ValueError(f"HTTP {r.status} em {url}")
+            if binario:
+                return await r.read()
+            return await (r.json(content_type=None) if json_ else r.text())
+
+
+async def versoes_ddragon() -> list[str]:
+    guardado = _ddragon_cache.get("versoes")
+    if guardado and time.time() - guardado[0] < 1800:
+        return guardado[1]
+    versoes = await _baixar("https://ddragon.leagueoflegends.com/api/versions.json")
+    _ddragon_cache["versoes"] = (time.time(), versoes)
+    return versoes
+
+
+async def versoes_de_patch() -> list[str]:
+    """Versões do ano atual (uma por atualização), da mais nova para a mais antiga. Máx. 25."""
+    versoes = await versoes_ddragon()
+    major = versoes[0].split(".")[0]
+    vistas, saida = set(), []
+    for v in versoes:
+        partes = v.split(".")
+        if partes[0] != major or partes[1] in vistas:
+            continue
+        vistas.add(partes[1])
+        saida.append(v)
+    return saida[:25]
+
+
+async def campeoes_completos(versao: str) -> dict[str, Any]:
+    chave = f"full:{versao}"
+    if chave not in _ddragon_cache:
+        _ddragon_cache[chave] = await _baixar(
+            f"https://ddragon.leagueoflegends.com/cdn/{versao}/data/pt_BR/championFull.json"
+        )
+        # Guarda só as duas versões mais recentes pedidas (os arquivos são grandes).
+        cheias = [k for k in _ddragon_cache if k.startswith("full:")]
+        for velha in cheias[:-3]:
+            _ddragon_cache.pop(velha, None)
+    return _ddragon_cache[chave]
+
+
+def _numeros(valor: Any) -> str:
+    if isinstance(valor, list):
+        valores = [_numeros(v) for v in valor]
+        return valores[0] if len(set(valores)) == 1 else "/".join(valores)
+    if isinstance(valor, float) and valor.is_integer():
+        valor = int(valor)
+    return str(valor).replace(".", ",")
+
+
+async def mudancas_data_dragon(antigo: dict[str, Any], novo: dict[str, Any]) -> tuple[list[str], list[str], list[str]]:
+    """(campeões novos, skins novas, mudanças) com ÍCONES dos campeões no lugar dos nomes."""
+    dados_novos = novo.get("data", {})
+    ids = {int(c.get("key", 0)) for c in dados_novos.values()}
+    icones = await icones_campeoes(ids)
+
+    def icone(campeao: dict[str, Any]) -> str:
+        return icones.get(int(campeao.get("key", 0))) or f"**{campeao.get('name', '?')}**"
+
+    campeoes_novos, skins_novas, mudancas = [], [], []
+    velhos = antigo.get("data", {})
+    for chave, campeao in sorted(dados_novos.items(), key=lambda item: item[1].get("name", "")):
+        anterior = velhos.get(chave)
+        if anterior is None:
+            campeoes_novos.append(icone(campeao))
+            continue
+        skins_antigas = {s.get("num") for s in anterior.get("skins", [])}
+        for skin in campeao.get("skins", []):
+            if skin.get("num") not in skins_antigas and skin.get("name") != "default":
+                skins_novas.append(f"{icone(campeao)} {skin.get('name', '')}")
+        linhas = []
+        for atributo, rotulo in ROTULOS_ATRIBUTOS.items():
+            a, b = anterior.get("stats", {}).get(atributo), campeao.get("stats", {}).get(atributo)
+            if a is not None and b is not None and a != b:
+                linhas.append(f"{'🔺' if b > a else '🔻'} {rotulo} {_numeros(a)} → {_numeros(b)}")
+        for i, (magia_a, magia_b) in enumerate(zip(anterior.get("spells", []), campeao.get("spells", []))):
+            for campo, rotulo in (("cooldown", "recarga"), ("cost", "custo"), ("range", "alcance")):
+                a, b = magia_a.get(campo), magia_b.get(campo)
+                if a and b and a != b:
+                    linhas.append(f"🔄 {'QWER'[i] if i < 4 else '?'} {rotulo} {_numeros(a)} → {_numeros(b)}")
+        if linhas:
+            resto = f" • … +{len(linhas) - 3}" if len(linhas) > 3 else ""
+            mudancas.append(f"{icone(campeao)} " + " • ".join(linhas[:3]) + resto)
+    return campeoes_novos, skins_novas, mudancas
+
+
+def imagens_da_pagina(html: str) -> tuple[str | None, list[str]]:
+    """(imagem de destaques, artes das skins) da página oficial das notas."""
+    corte = html.find('id="__NEXT_DATA__"')
+    visivel = html[:corte] if corte > 0 else html
+    padrao = r'https://cmsassets\.rgpub\.io/sanity/images/[^"\'\s<>()?]+?-(\d+)x(\d+)\.(?:png|jpe?g|webp)'
+
+    def imagens(trecho: str) -> list[tuple[str, int, int]]:
+        vistas, saida = set(), []
+        for m in re.finditer(padrao, trecho):
+            if m.group(0) not in vistas:
+                vistas.add(m.group(0))
+                saida.append((m.group(0), int(m.group(1)), int(m.group(2))))
+        return saida
+
+    baixo = visivel.lower()
+    capa = re.search(r'property="og:image"\s+content="([^"]+)"', html)
+    capa_url = capa.group(1).split("?")[0] if capa else ""
+    destaque = None
+    inicio = next((baixo.find(t) for t in ("destaques da atualiza", "destaques do patch", "patch highlights")
+                   if baixo.find(t) >= 0), -1)
+    for url, largura, altura in imagens(visivel[inicio:] if inicio >= 0 else visivel):
+        if url != capa_url and largura >= 1200 and 1.6 <= largura / altura <= 1.9:
+            destaque = url
+            break
+    skins = []
+    ini = next((baixo.find(t) for t in ("cromas e skins futur", "skins e cromas futur", "próximas skins",
+                                        "upcoming skins") if baixo.find(t) >= 0), -1)
+    if ini >= 0:
+        fim = next((baixo.find(t, ini) for t in ("artigos relacionados", "related articles")
+                    if baixo.find(t, ini) >= 0), len(visivel))
+        for url, largura, altura in imagens(visivel[ini:fim]):
+            if largura >= 1200 and largura / altura <= 2.2 and url != destaque:  # skins, não as tiras de cromas
+                skins.append(url)
+    return destaque, skins
+
+
+async def montar_patch(versao: str | None = None) -> tuple[str, list[discord.Embed]]:
+    versoes = await versoes_ddragon()
+    versao = versao or versoes[0]
+    if versao in _patch_cache:
+        return versao, _patch_cache[versao]
+    anterior = versoes[versoes.index(versao) + 1] if versao in versoes and versoes.index(versao) + 1 < len(versoes) else None
+    ano, numero = nome_do_patch(versao)
+
+    link, html = None, ""
+    try:
+        url = PATCH_URL.format(ano=ano, numero=numero)
+        html = await _baixar(url, json_=False)
+        link = url
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+        pass
+    destaque, artes = imagens_da_pagina(html) if html else (None, [])
+
+    novos, skins, mudancas = [], [], []
+    if anterior:
+        try:
+            velho, atual = await asyncio.gather(campeoes_completos(anterior), campeoes_completos(versao))
+            novos, skins, mudancas = await mudancas_data_dragon(velho, atual)
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, KeyError) as exc:
+            log.warning("Patch: não consegui comparar o Data Dragon: %s", exc)
+
+    partes = []
+    if novos:
+        partes.append("🆕 **Campeão novo:** " + " ".join(novos))
+    if skins:
+        partes.append("🎨 **Skins novas**\n" + "\n".join(skins[:10]) + ("\n…" if len(skins) > 10 else ""))
+    if mudancas:
+        texto = "\n".join(mudancas)
+        if len(texto) > 2400:
+            texto = texto[:2400].rsplit("\n", 1)[0] + "\n… veja o resto nas notas."
+        partes.append("📊 **Mudanças em números**\n" + texto)
+    if link:
+        partes.append(f"🔗 **[Ler as notas completas]({link})**")
+    else:
+        partes.append("⏳ As notas em português desta atualização ainda não foram publicadas.")
+
+    principal = discord.Embed(title=f"📋 Notas da Atualização {ano}.{numero}", url=link,
+                              description="\n\n".join(partes)[:4096], color=0xC8AA6E)
+    if destaque:
+        principal.set_image(url=destaque)
+    embeds = [principal]
+    galeria = (link or "https://www.leagueoflegends.com/pt-br/") + "#skins"
+    for i, arte in enumerate(artes[:4]):
+        e = discord.Embed(url=galeria, color=0xC8AA6E)
+        if i == 0:
+            e.title = "🎨 Skins desta atualização"
+        e.set_image(url=arte)
+        embeds.append(e)
+    embeds[-1].set_footer(text="Imagens e notas: Riot Games • Números: Data Dragon")
+    caber_no_discord(embeds)
+    if link:
+        _patch_cache[versao] = embeds
+    return versao, embeds
+
+
+async def _opcoes_patch() -> list[discord.SelectOption]:
+    opcoes = []
+    for i, v in enumerate(await versoes_de_patch()):
+        ano, numero = nome_do_patch(v)
+        opcoes.append(discord.SelectOption(label=f"Atualização {ano}.{numero}", value=v,
+                                           description="Mais recente" if i == 0 else None, emoji="📋"))
+    return opcoes
+
+
+class PatchSelecaoView(discord.ui.View):
+    """Menu 'Ver atualizações anteriores' (continua funcionando depois de reiniciar)."""
+
+    def __init__(self, opcoes: list[discord.SelectOption] | None = None) -> None:
+        super().__init__(timeout=None)
+        self.seletor = discord.ui.Select(
+            custom_id="patch:anteriores", placeholder="📚 Ver atualizações anteriores",
+            options=opcoes or [discord.SelectOption(label="Carregando...", value="carregando")],
+        )
+        self.seletor.callback = self.escolher
+        self.add_item(self.seletor)
+
+    @classmethod
+    async def criar(cls) -> "PatchSelecaoView":
+        try:
+            return cls(await _opcoes_patch())
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+            return cls()
+
+    async def escolher(self, inter: discord.Interaction) -> None:
+        versao = (inter.data or {}).get("values", [None])[0]
+        if not versao or versao == "carregando":
+            await inter.response.send_message("Tente de novo em instantes.", ephemeral=True)
+            return
+        await inter.response.defer(ephemeral=True, thinking=True)
+        try:
+            _v, embeds = await montar_patch(versao)
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, KeyError):
+            await inter.followup.send("⚠️ Não consegui buscar essa atualização agora.", ephemeral=True)
+            return
+        await inter.followup.send(embeds=embeds[:10], ephemeral=True)
+
+
+async def autocompletar_patch(inter: discord.Interaction, atual: str) -> list[app_commands.Choice[str]]:
+    try:
+        versoes = await versoes_de_patch()
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+        return []
+    escolhas = []
+    for i, v in enumerate(versoes):
+        nome = "Atualização {}.{}".format(*nome_do_patch(v)) + (" (mais recente)" if i == 0 else "")
+        if atual.strip().lower() in nome.lower():
+            escolhas.append(app_commands.Choice(name=nome, value=v))
+    return escolhas[:25]
+
+
+@bot.tree.command(name="patch", description="Notas da atualização do LoL (deixe vazio para a mais recente)")
+@app_commands.describe(atualizacao="Escolha uma atualização anterior. Vazio = a mais recente")
+@app_commands.autocomplete(atualizacao=autocompletar_patch)
+async def patch(inter: discord.Interaction, atualizacao: Optional[str] = None) -> None:
+    await inter.response.defer(thinking=True)
+    try:
+        if atualizacao and atualizacao not in await versoes_ddragon():
+            atualizacao = None
+        _versao, embeds = await montar_patch(atualizacao)
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, KeyError) as exc:
+        log.warning("Patch: falhou: %s", exc)
+        await inter.followup.send("⚠️ Não consegui buscar a atualização agora. Tente de novo em alguns minutos.")
+        return
+    await inter.followup.send(embeds=embeds[:10], view=await PatchSelecaoView.criar())
+
+
+async def checar_patch_novo() -> None:
+    servidores = [g for g in bot.guilds if destino_aviso(g, "patch")]
+    if not servidores:
+        return
+    versao = (await versoes_ddragon())[0]
+    estado = avisos.setdefault("_estado", {})
+    if estado.get("patch") is None:
+        estado["patch"] = versao  # Primeira vez: só as próximas atualizações.
+        _salvar_json(ARQUIVO_AVISOS, avisos)
+        return
+    if estado["patch"] == versao:
+        return
+    versao, embeds = await montar_patch(versao)
+    if versao not in _patch_cache:
+        return  # As notas em português ainda não saíram; tenta de novo depois.
+    view = await PatchSelecaoView.criar()
+    for guild in servidores:
+        await enviar_aviso(guild, "patch", embeds=embeds, view=view, versao=".".join(nome_do_patch(versao)))
+    estado["patch"] = versao
+    _salvar_json(ARQUIVO_AVISOS, avisos)
+
+
+# =====================================================================
+# ================= ROTAÇÃO GRÁTIS (champion-v3, oficial) ===============
+# =====================================================================
+async def _icones_ou_nomes(ids: list[int]) -> list[str]:
+    icones = await icones_campeoes(set(ids))
+    nomes = await nomes_campeoes()
+    return [icones.get(i) or f"**{nomes.get(i, i)}**" for i in ids]
+
+
+async def montar_rotacao() -> discord.Embed:
+    dados = await chamar_riot(
+        f"https://{RIOT_PLATAFORMA}.api.riotgames.com/lol/platform/v3/champion-rotations"
+    )
+    nomes = await nomes_campeoes()
+    gratis = sorted(dados.get("freeChampionIds", []), key=lambda i: nomes.get(i, ""))
+    novatos = sorted(dados.get("freeChampionIdsForNewPlayers", []), key=lambda i: nomes.get(i, ""))
+    embed = discord.Embed(title="🔄 Rotação grátis da semana", color=0x0AC8B9,
+                          description=" ".join(await _icones_ou_nomes(gratis))[:4000] or "—")
+    if novatos:
+        embed.add_field(
+            name=f"🌱 Para novos jogadores (até o nível {dados.get('maxNewPlayerLevel', 10)})",
+            value=" ".join(await _icones_ou_nomes(novatos))[:1024], inline=False,
+        )
+    embed.set_footer(text="Dados oficiais da Riot Games")
+    return embed
+
+
+@bot.tree.command(name="rotacao", description="Campeões grátis desta semana")
+async def rotacao(inter: discord.Interaction) -> None:
+    await inter.response.defer(thinking=True)
+    try:
+        await inter.followup.send(embed=await montar_rotacao())
+    except (ErroRiot, aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
+        await inter.followup.send(f"⚠️ Não consegui buscar a rotação agora. {exc if isinstance(exc, ErroRiot) else ''}")
+
+
+async def checar_rotacao_nova() -> None:
+    servidores = [g for g in bot.guilds if destino_aviso(g, "rotacao")]
+    if not servidores:
+        return
+    dados = await chamar_riot(
+        f"https://{RIOT_PLATAFORMA}.api.riotgames.com/lol/platform/v3/champion-rotations"
+    )
+    atual = sorted(dados.get("freeChampionIds", []))
+    estado = avisos.setdefault("_estado", {})
+    if estado.get("rotacao") is None:
+        estado["rotacao"] = atual  # Primeira vez: só avisa quando mudar (toda terça).
+        _salvar_json(ARQUIVO_AVISOS, avisos)
+        return
+    if estado["rotacao"] == atual:
+        return
+    embed = await montar_rotacao()
+    for guild in servidores:
+        await enviar_aviso(guild, "rotacao", embeds=[embed], data=time.strftime("%d/%m"))
+    estado["rotacao"] = atual
+    _salvar_json(ARQUIVO_AVISOS, avisos)
+
+
+# =====================================================================
+# ============== STATUS DOS SERVIDORES (lol-status-v4, oficial) =========
+# =====================================================================
+def _traduzir(itens: list[dict[str, Any]], campo: str = "content") -> str:
+    for preferido in ("pt_BR", "pt-BR", "en_US", "en-US"):
+        for item in itens or []:
+            if str(item.get("locale", "")).replace("-", "_") == preferido.replace("-", "_"):
+                return str(item.get(campo, ""))
+    return str((itens or [{}])[0].get(campo, "")) if itens else ""
+
+
+def _embed_ocorrencia(ocorrencia: dict[str, Any], tipo: str, resolvido: bool = False) -> discord.Embed:
+    titulo = _traduzir(ocorrencia.get("titles", [])) or ("Manutenção" if tipo == "maintenances" else "Problema")
+    atualizacoes = ocorrencia.get("updates") or []
+    texto = _traduzir(atualizacoes[0].get("translations", [])) if atualizacoes else ""
+    if resolvido:
+        emoji, cor = "✅", 0x4ADE80
+    elif tipo == "maintenances":
+        emoji, cor = "🛠️", 0xF5C542
+    else:
+        gravidade = str(ocorrencia.get("incident_severity") or "").lower()
+        emoji, cor = ("🔴", 0xE84057) if gravidade == "critical" else ("⚠️", 0xF59E0B)
+    embed = discord.Embed(
+        title=f"{emoji} {'Resolvido: ' if resolvido else ''}{titulo}"[:256],
+        description=(texto or "Sem detalhes.")[:4000], color=cor,
+    )
+    plataformas = ", ".join(ocorrencia.get("platforms") or [])
+    embed.set_footer(text=f"Servidor {RIOT_PLATAFORMA.upper()}" + (f" • {plataformas}" if plataformas else ""))
+    return embed
+
+
+async def _status_bruto() -> dict[str, Any]:
+    return await chamar_riot(f"https://{RIOT_PLATAFORMA}.api.riotgames.com/lol/status/v4/platform-data")
+
+
+async def montar_status_atual() -> discord.Embed:
+    dados = await _status_bruto()
+    ocorrencias = [(o, "maintenances") for o in dados.get("maintenances", [])] + \
+                  [(o, "incidents") for o in dados.get("incidents", [])]
+    if not ocorrencias:
+        return discord.Embed(title=f"🟢 Servidor {dados.get('name', RIOT_PLATAFORMA.upper())} funcionando normalmente",
+                             color=0x4ADE80)
+    embed = _embed_ocorrencia(*ocorrencias[0])
+    for o, t in ocorrencias[1:4]:
+        extra = _embed_ocorrencia(o, t)
+        embed.add_field(name=extra.title or "—", value=(extra.description or "—")[:1024], inline=False)
+    return embed
+
+
+@bot.tree.command(name="status_lol", description="Mostra se o servidor BR do LoL está com problema ou em manutenção")
+async def status_lol(inter: discord.Interaction) -> None:
+    await inter.response.defer(thinking=True)
+    try:
+        await inter.followup.send(embed=await montar_status_atual())
+    except (ErroRiot, aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
+        await inter.followup.send(f"⚠️ Não consegui consultar agora. {exc if isinstance(exc, ErroRiot) else ''}")
+
+
+async def checar_status_novo() -> None:
+    servidores = [g for g in bot.guilds if destino_aviso(g, "status")]
+    if not servidores:
+        return
+    dados = await _status_bruto()
+    estado = avisos.setdefault("_estado", {})
+    vistos: dict[str, Any] = estado.setdefault("status", {})  # id -> {"tipo", "atualizacoes", "ocorrencia"}
+    atuais = {}
+    for tipo in ("maintenances", "incidents"):
+        for o in dados.get(tipo, []):
+            atuais[str(o.get("id"))] = (o, tipo)
+    embeds = []
+    for oid, (o, tipo) in atuais.items():
+        n_atualizacoes = len(o.get("updates") or [])
+        anterior = vistos.get(oid)
+        if anterior is None or anterior.get("atualizacoes", 0) < n_atualizacoes:
+            embeds.append(_embed_ocorrencia(o, tipo))
+        vistos[oid] = {"tipo": tipo, "atualizacoes": n_atualizacoes, "ocorrencia": o}
+    for oid in [i for i in vistos if i not in atuais]:
+        embeds.append(_embed_ocorrencia(vistos[oid].get("ocorrencia") or {}, vistos[oid].get("tipo", "incidents"),
+                                        resolvido=True))
+        vistos.pop(oid, None)
+    if not estado.get("status_iniciado"):
+        estado["status_iniciado"] = True  # Primeira vez: não repete o que já estava aberto.
+        _salvar_json(ARQUIVO_AVISOS, avisos)
+        return
+    _salvar_json(ARQUIVO_AVISOS, avisos)
+    for embed in embeds[:5]:
+        for guild in servidores:
+            await enviar_aviso(guild, "status", embeds=[embed], titulo=embed.title or "")
+
+
+# =====================================================================
+# =============================== /quiz ===============================
+# =====================================================================
+ARQUIVO_QUIZ = Path("/data/quiz.json")
+quiz_pontos: dict[str, dict[str, int]] = _carregar_json(ARQUIVO_QUIZ, {})
+QUIZ_SEGUNDOS = 30
+_quiz_ativo: set[int] = set()
+CLASSES_PT = {"Fighter": "Lutador", "Mage": "Mago", "Assassin": "Assassino", "Marksman": "Atirador",
+              "Support": "Suporte", "Tank": "Tanque"}
+
+
+async def gerar_pergunta() -> dict[str, Any]:
+    versao = (await versoes_ddragon())[0]
+    dados = (await campeoes_completos(versao)).get("data", {})
+    campeoes = [c for c in dados.values() if c.get("spells")]
+    certo = random.choice(campeoes)
+    errados = random.sample([c for c in campeoes if c["id"] != certo["id"]], 3)
+    base_img = f"https://ddragon.leagueoflegends.com/cdn/{versao}/img"
+    tipo = random.choice(["titulo", "habilidade", "habilidade", "passiva", "tecla", "lore", "classe"])
+    pergunta: dict[str, Any] = {"imagem": None}
+
+    if tipo == "tecla":
+        i = random.randrange(4)
+        magia = certo["spells"][i]
+        pergunta.update(texto=f"Em qual tecla fica **{magia['name']}** de **{certo['name']}**?",
+                        opcoes=[("Q", None), ("W", None), ("E", None), ("R", None)], correta=i,
+                        imagem=f"{base_img}/spell/{magia['image']['full']}")
+        return pergunta
+    if tipo == "classe":
+        classe = CLASSES_PT.get((certo.get("tags") or ["Fighter"])[0], "Lutador")
+        outras = random.sample([c for c in CLASSES_PT.values() if c != classe], 3)
+        opcoes = [classe] + outras
+        random.shuffle(opcoes)
+        pergunta.update(texto=f"Qual é a classe principal de **{certo['name']}**?",
+                        opcoes=[(o, None) for o in opcoes], correta=opcoes.index(classe),
+                        imagem=f"{base_img}/champion/{certo['image']['full']}")
+        return pergunta
+
+    opcoes_c = [certo] + errados
+    random.shuffle(opcoes_c)
+    icones = await icones_campeoes({int(c["key"]) for c in opcoes_c})
+    pergunta["opcoes"] = [(c["name"], icones.get(int(c["key"]))) for c in opcoes_c]
+    pergunta["correta"] = opcoes_c.index(certo)
+    if tipo == "titulo":
+        pergunta["texto"] = f"Qual campeão é conhecido como **{certo.get('title', '').capitalize()}**?"
+    elif tipo == "habilidade":
+        magia = random.choice(certo["spells"])
+        pergunta["texto"] = f"De qual campeão é a habilidade **{magia['name']}**?"
+        pergunta["imagem"] = f"{base_img}/spell/{magia['image']['full']}"
+    elif tipo == "passiva":
+        passiva = certo.get("passive") or {}
+        pergunta["texto"] = f"De qual campeão é a passiva **{passiva.get('name', '?')}**?"
+        if passiva.get("image"):
+            pergunta["imagem"] = f"{base_img}/passive/{passiva['image']['full']}"
+    else:  # lore
+        historia = re.sub(re.escape(certo["name"]), "█████", certo.get("blurb", ""), flags=re.I)
+        pergunta["texto"] = f"De quem é esta história?\n> {historia[:600]}"
+    return pergunta
+
+
+class QuizView(discord.ui.View):
+    def __init__(self, pergunta: dict[str, Any]) -> None:
+        super().__init__(timeout=QUIZ_SEGUNDOS + 30)
+        self.pergunta = pergunta
+        self.respostas: dict[int, int] = {}
+        self.ordem: list[int] = []
+        for i, (rotulo, emoji) in enumerate(pergunta["opcoes"]):
+            botao = discord.ui.Button(label=rotulo[:80], style=discord.ButtonStyle.secondary,
+                                      emoji=discord.PartialEmoji.from_str(emoji) if emoji else None)
+            botao.callback = self._responder(i)
+            self.add_item(botao)
+
+    def _responder(self, indice: int):
+        async def callback(inter: discord.Interaction) -> None:
+            if inter.user.id in self.respostas:
+                await inter.response.send_message("Você já respondeu esta! 😉", ephemeral=True)
+                return
+            self.respostas[inter.user.id] = indice
+            self.ordem.append(inter.user.id)
+            await inter.response.send_message("✅ Resposta registrada! O resultado sai em instantes.", ephemeral=True)
+        return callback
+
+    def resultado(self, guild_id: int) -> str:
+        certa = self.pergunta["correta"]
+        acertaram = [u for u in self.ordem if self.respostas[u] == certa]
+        pontos = quiz_pontos.setdefault(str(guild_id), {})
+        for i, uid in enumerate(acertaram):
+            pontos[str(uid)] = pontos.get(str(uid), 0) + (2 if i == 0 else 1)
+        if acertaram:
+            _salvar_json(ARQUIVO_QUIZ, quiz_pontos)
+        rotulo = self.pergunta["opcoes"][certa][0]
+        if not acertaram:
+            return f"✅ Resposta: **{rotulo}**\n😶 Ninguém acertou dessa vez."
+        quem = f"🥇 <@{acertaram[0]}> (+2)"
+        if len(acertaram) > 1:
+            quem += " • " + ", ".join(f"<@{u}>" for u in acertaram[1:15]) + " (+1)"
+        return f"✅ Resposta: **{rotulo}**\n{quem}"
+
+    def revelar(self) -> None:
+        for i, item in enumerate(self.children):
+            if isinstance(item, discord.ui.Button):
+                item.disabled = True
+                item.style = discord.ButtonStyle.success if i == self.pergunta["correta"] else discord.ButtonStyle.secondary
+
+
+async def iniciar_quiz(canal: discord.abc.Messageable, mensagem: str | None = None) -> bool:
+    canal_id = getattr(canal, "id", 0)
+    if canal_id in _quiz_ativo:
+        return False
+    _quiz_ativo.add(canal_id)
+    try:
+        pergunta = await gerar_pergunta()
+        embed = discord.Embed(title="🃏 Quiz de LoL", description=pergunta["texto"], color=0xC8AA6E)
+        if pergunta.get("imagem"):
+            embed.set_thumbnail(url=pergunta["imagem"])
+        fim = int(time.time()) + QUIZ_SEGUNDOS
+        embed.add_field(name="⏱️ Tempo", value=f"Termina <t:{fim}:R> • 1º a acertar ganha 2 pontos, os outros 1")
+        view = QuizView(pergunta)
+        msg = await canal.send(content=mensagem, embed=embed, view=view, allowed_mentions=MENCOES_AVISO)
+    except Exception:
+        _quiz_ativo.discard(canal_id)
+        raise
+
+    async def encerrar() -> None:
+        try:
+            await asyncio.sleep(QUIZ_SEGUNDOS)
+            guild_id = getattr(getattr(canal, "guild", None), "id", 0)
+            texto = view.resultado(guild_id)
+            view.revelar()
+            embed.set_field_at(0, name="🏁 Resultado", value=texto[:1024], inline=False)
+            await msg.edit(embed=embed, view=view)
+            view.stop()
+        except discord.HTTPException as exc:
+            log.warning("Quiz: não consegui encerrar: %s", exc)
+        finally:
+            _quiz_ativo.discard(canal_id)
+
+    asyncio.create_task(encerrar())
+    return True
+
+
+@bot.tree.command(name="quiz", description="Uma pergunta de LoL valendo pontos no ranking do servidor")
+@app_commands.guild_only()
+async def quiz(inter: discord.Interaction) -> None:
+    if inter.channel_id in _quiz_ativo:
+        await inter.response.send_message("⏳ Já tem um quiz rolando neste canal!", ephemeral=True)
+        return
+    await inter.response.send_message("🃏 Preparando a pergunta...", ephemeral=True)
+    try:
+        await iniciar_quiz(inter.channel)
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, KeyError, discord.HTTPException) as exc:
+        log.warning("Quiz: falhou: %s", exc)
+        await inter.followup.send("⚠️ Não consegui montar a pergunta agora.", ephemeral=True)
+
+
+@bot.tree.command(name="quiz_ranking", description="Ranking de pontos do quiz no servidor")
+@app_commands.guild_only()
+async def quiz_ranking(inter: discord.Interaction) -> None:
+    pontos = quiz_pontos.get(str(inter.guild_id), {})
+    if not pontos:
+        await inter.response.send_message("Ninguém pontuou ainda. Use `/quiz`!", ephemeral=True)
+        return
+    medalhas = ["🥇", "🥈", "🥉"]
+    linhas = [f"{medalhas[i] if i < 3 else f'`{i + 1}.`'} <@{uid}> — **{p}** pts"
+              for i, (uid, p) in enumerate(sorted(pontos.items(), key=lambda x: -x[1])[:15])]
+    await inter.response.send_message(
+        embed=discord.Embed(title="🃏 Ranking do Quiz", description="\n".join(linhas), color=0xC8AA6E),
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+async def checar_quiz_automatico() -> None:
+    agora = time.time()
+    for guild in bot.guilds:
+        cfg = config_aviso(guild.id, "quiz")
+        destino = destino_aviso(guild, "quiz")
+        if not cfg or destino is None or agora < float(cfg.get("proximo") or 0):
+            continue
+        cfg["proximo"] = agora + int(cfg.get("intervalo") or 6) * 3600
+        _salvar_json(ARQUIVO_AVISOS, avisos)
+        try:
+            await iniciar_quiz(destino, mensagem_aviso(guild.id, "quiz"))
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, KeyError, discord.HTTPException) as exc:
+            log.warning("Quiz automático: %s", exc)
+
+
+# =====================================================================
+# ============ HISTÓRICO DAS PARTIDAS INTERNAS + REVANCHE ===============
+# =====================================================================
+# Todo vencedor registrado (pelo app, pelos botões ou pelo /partida_finalizar)
+# entra no histórico, que alimenta o /perfil. O anúncio ganha o botão Revanche.
+ARQUIVO_HISTORICO = Path("/data/historico_interno.json")
+historico_interno: list[dict[str, Any]] = _carregar_json(ARQUIVO_HISTORICO, [])
+_encerrar_partida_original = encerrar_partida
+
+
+async def encerrar_partida(guild: discord.Guild, chave_partida: str, vencedor: str | None) -> str:  # noqa: F811
+    """Mesma função do bot, mas guarda o resultado no histórico interno."""
+    partida = partidas.get(chave_partida)
+    mensagem = await _encerrar_partida_original(guild, chave_partida, vencedor)
+    if partida and partida.get("vencedor") and not partida.get("_registro_id"):
+        registro_id = int(time.time() * 1000)
+        historico_interno.append({
+            "id": registro_id, "guild": guild.id, "data": int(time.time()),
+            "numero": partida.get("numero", 1), "vencedor": partida["vencedor"],
+            "times": {uid: c.get("time") for uid, c in (partida.get("participantes") or {}).items()},
+            "origens": {uid: c.get("origem_id") for uid, c in (partida.get("participantes") or {}).items()},
+            "origem_id": partida.get("origem_id"),
+            "equipes": list((partida.get("canais") or {}).keys()) or ["vermelho", "azul"],
+            "canal_aviso": partida.get("assistir_channel_id"),
+        })
+        del historico_interno[:-5000]
+        partida["_registro_id"] = registro_id
+        if chave_partida in partidas:
+            salvar_partidas()
+        try:
+            _salvar_json(ARQUIVO_HISTORICO, historico_interno)
+        except OSError as exc:
+            log.warning("Não consegui salvar o histórico interno: %s", exc)
+    return mensagem
+
+
+async def criar_partida_interna(
+    guild: discord.Guild, times: dict[str, list[discord.Member]], origens: dict[str, int],
+    origem_padrao: int | None, canal_aviso_id: int | None,
+) -> tuple[str, dict[str, Any], int]:
+    """Cria categoria e canais de voz privados (igual à /queue) e move quem está em call."""
+    eu = guild.me
+    chave = f"revanche:{int(time.time() * 1000)}"
+    numero = numero_livre_partida(guild.id)
+    partida: dict[str, Any] = {
+        "guild_id": guild.id, "numero": numero, "origem_id": origem_padrao, "categoria_id": None,
+        "canais": {}, "vencedor": None, "espectadores": {}, "assistir_channel_id": canal_aviso_id,
+        "assistir_message_id": None,
+        "participantes": {str(m.id): {"origem_id": origens.get(str(m.id), origem_padrao), "time": t}
+                          for t, membros in times.items() for m in membros},
+    }
+    partidas[chave] = partida
+    salvar_partidas()
+    try:
+        categoria = await guild.create_category(f"🔒 PARTIDA {numero} EM ANDAMENTO", reason="Revanche")
+        partida["categoria_id"] = categoria.id
+        salvar_partidas()
+        for chave_time, emoji, nome in EQUIPES:
+            if chave_time not in times:
+                continue
+            canal = await guild.create_voice_channel(
+                f"{emoji} Time {nome} 🔒", category=categoria,
+                overwrites=permissoes_de_time(guild, eu, times[chave_time]), user_limit=0,
+                reason=f"Revanche: canal privado do Time {nome}",
+            )
+            partida["canais"][chave_time] = canal.id
+            salvar_partidas()
+    except (discord.Forbidden, discord.HTTPException) as exc:
+        log.exception("Revanche: falha ao criar canais: %s", exc)
+        await remover_estrutura(guild, partida)
+        partidas.pop(chave, None)
+        salvar_partidas()
+        raise
+    movidos = 0
+    for chave_time, membros in times.items():
+        destino = buscar_voz(guild, partida["canais"].get(chave_time))
+        for membro in membros:
+            if membro.voice and membro.voice.channel and destino:
+                try:
+                    await membro.move_to(destino, reason="Revanche")
+                    movidos += 1
+                except (discord.Forbidden, discord.HTTPException) as exc:
+                    log.warning("Revanche: não consegui mover %s: %s", membro.id, exc)
+    return chave, partida, movidos
+
+
+class BotaoRevanche(discord.ui.DynamicItem[discord.ui.Button], template=r"revanche:(?P<id>\d+)"):
+    def __init__(self, registro_id: int) -> None:
+        super().__init__(discord.ui.Button(label="Revanche", emoji="🔁", style=discord.ButtonStyle.primary,
+                                           custom_id=f"revanche:{registro_id}"))
+        self.registro_id = registro_id
+
+    @classmethod
+    async def from_custom_id(cls, interaction: discord.Interaction, item: discord.ui.Button, match: re.Match[str]):
+        return cls(int(match["id"]))
+
+    async def callback(self, inter: discord.Interaction) -> None:
+        guild = inter.guild
+        registro = next((r for r in historico_interno if r.get("id") == self.registro_id), None)
+        if guild is None or registro is None or registro.get("guild") != guild.id:
+            await inter.response.send_message("ℹ️ Não encontrei essa partida.", ephemeral=True)
+            return
+        participante = str(inter.user.id) in registro["times"]
+        if not (participante or autorizado(inter) or await pode_gerenciar_contas(inter)):
+            await inter.response.send_message("⛔ Só quem jogou a partida ou a staff pode pedir revanche.", ephemeral=True)
+            return
+        if registro.get("revanche_usada"):
+            await inter.response.send_message("🔁 A revanche desta partida já foi criada.", ephemeral=True)
+            return
+        await inter.response.defer()
+        async with trava_servidor(guild.id):
+            ocupados = {uid for _c, p in partidas_do_servidor(guild.id) for uid in (p.get("participantes") or {})}
+            em_jogo = [uid for uid in registro["times"] if uid in ocupados]
+            if em_jogo:
+                await inter.followup.send(
+                    "⚠️ " + ", ".join(f"<@{u}>" for u in em_jogo[:10]) + " já está em outra partida.",
+                    ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+                return
+            times: dict[str, list[discord.Member]] = {}
+            origens: dict[str, int] = {}
+            for uid, time_chave in registro["times"].items():
+                membro = guild.get_member(int(uid))
+                if membro is None or not time_chave:
+                    continue
+                times.setdefault(time_chave, []).append(membro)
+                atual = membro.voice.channel.id if membro.voice and membro.voice.channel else None
+                origens[uid] = atual or registro["origens"].get(uid) or registro.get("origem_id")
+            if not times:
+                await inter.followup.send("⚠️ Nenhum jogador da partida está no servidor.", ephemeral=True)
+                return
+            registro["revanche_usada"] = True
+            _salvar_json(ARQUIVO_HISTORICO, historico_interno)
+            try:
+                _chave, partida, movidos = await criar_partida_interna(
+                    guild, times, origens, registro.get("origem_id"), inter.channel_id)
+            except (discord.Forbidden, discord.HTTPException):
+                registro["revanche_usada"] = False
+                _salvar_json(ARQUIVO_HISTORICO, historico_interno)
+                await inter.followup.send("❌ Não consegui criar os canais. Confira as permissões do bot.")
+                return
+        try:
+            await inter.message.edit(view=None)
+        except (discord.HTTPException, AttributeError):
+            pass
+        linhas = [f"🔁 **Revanche!** Partida {partida['numero']} criada com os mesmos times."]
+        for chave_time, emoji, nome in EQUIPES:
+            if chave_time in times:
+                linhas.append(f"{emoji} **{nome}:** " + ", ".join(m.mention for m in times[chave_time]))
+        linhas.append(f"↪️ Pessoas movidas: **{movidos}**.")
+        await inter.followup.send("\n".join(linhas), allowed_mentions=discord.AllowedMentions.none())
+
+
+def view_revanche(partida: dict[str, Any]) -> discord.ui.View | None:
+    registro_id = partida.get("_registro_id")
+    if not registro_id:
+        return None
+    view = discord.ui.View(timeout=None)
+    view.add_item(BotaoRevanche(int(registro_id)))
+    return view
+
+
+# =====================================================================
+# ======================== /perfil (cartão em imagem) ===================
+# =====================================================================
+# Precisa do Pillow (requirements.txt) e das fontes da pasta "fonts" ao lado do bot.
+try:
+    from PIL import Image, ImageDraw, ImageFilter, ImageFont
+except ImportError:  # O resto do bot funciona sem o Pillow.
+    Image = None  # type: ignore[assignment]
+
+PASTA_FONTES = Path(__file__).resolve().parent / "fonts"
+CORES_TIER = {
+    "IRON": "#7A6E6A", "BRONZE": "#A0694A", "SILVER": "#9FB0BC", "GOLD": "#E0B95B",
+    "PLATINUM": "#4FC3B0", "EMERALD": "#34C77B", "DIAMOND": "#7A8CF0", "MASTER": "#B266E0",
+    "GRANDMASTER": "#E05555", "CHALLENGER": "#F4D27A",
+}
+
+
+import functools
+import math
+
+
+@functools.lru_cache(maxsize=128)
+def _fonte(tamanho: int, negrito: bool = False):
+    arquivo = PASTA_FONTES / ("DejaVuSans-Bold.ttf" if negrito else "DejaVuSans.ttf")
+    try:
+        return ImageFont.truetype(str(arquivo), tamanho)
+    except OSError:
+        return ImageFont.load_default(size=tamanho)
+
+
+def estatisticas_internas(guild_id: int, uid: int) -> dict[str, Any]:
+    jogos = [r for r in historico_interno if r.get("guild") == guild_id and str(uid) in r.get("times", {})]
+    jogos.sort(key=lambda r: r.get("data", 0))
+    vitorias = derrotas = seq = melhor = 0
+    parceiros: dict[str, int] = {}
+    for r in jogos:
+        meu_time = r["times"][str(uid)]
+        venceu = r.get("vencedor") == meu_time
+        if venceu:
+            vitorias += 1
+            seq = seq + 1 if seq >= 0 else 1
+            for outro, t in r["times"].items():
+                if outro != str(uid) and t == meu_time:
+                    parceiros[outro] = parceiros.get(outro, 0) + 1
+        else:
+            derrotas += 1
+            seq = seq - 1 if seq <= 0 else -1
+        melhor = max(melhor, seq)
+    return {"vitorias": vitorias, "derrotas": derrotas, "jogos": len(jogos), "sequencia": seq,
+            "melhor_sequencia": melhor, "parceiro": max(parceiros.items(), key=lambda x: x[1]) if parceiros else None}
+
+
+def medalhas_do_membro(guild_id: int, uid: int, est: dict[str, Any], pontos_main: int) -> list[str]:
+    medalhas = []
+    if est["vitorias"] >= 1:
+        medalhas.append("Primeira vitória")
+    for meta in (50, 25, 10):
+        if est["vitorias"] >= meta:
+            medalhas.append(f"{meta} vitórias")
+            break
+    if est["sequencia"] >= 3:
+        medalhas.append(f"Em chamas ({est['sequencia']} seguidas)")
+    elif est["melhor_sequencia"] >= 5:
+        medalhas.append(f"Recorde: {est['melhor_sequencia']} seguidas")
+    if est["jogos"] >= 30:
+        medalhas.append("Veterano")
+    if est["parceiro"] and est["parceiro"][1] >= 5:
+        medalhas.append("Dupla imbatível")
+    vit_por_membro: dict[str, int] = {}
+    for r in historico_interno:
+        if r.get("guild") == guild_id:
+            for outro, t in r["times"].items():
+                if t == r.get("vencedor"):
+                    vit_por_membro[outro] = vit_por_membro.get(outro, 0) + 1
+    if est["vitorias"] >= 3 and vit_por_membro and max(vit_por_membro, key=vit_por_membro.get) == str(uid):
+        medalhas.insert(0, "Rei do servidor")
+    pontos_quiz = quiz_pontos.get(str(guild_id), {})
+    if pontos_quiz.get(str(uid), 0) >= 5 and max(pontos_quiz, key=pontos_quiz.get) == str(uid):
+        medalhas.append("Mestre do quiz")
+    if pontos_main >= 500_000:
+        medalhas.append("Fiel ao main")
+    return medalhas[:6]
+
+
+# Temas do cartão: combinações fofas (o primeiro é o padrão).
+TEMAS_CARTAO: dict[str, dict[str, str]] = {
+    # ---- Fofos (rosa) ----
+    "rosa_lilas":    {"nome": "🌸 Rosa & Lilás", "acento": "#FF9EC4", "segunda": "#C9A7FF", "escuro": "#24122E",
+                      "texto": "#FFF4FA", "suave": "#E3C3DA", "pilula": "#3A1D47", "estilo": "fofo"},
+    "rosa_azul":     {"nome": "🩵 Rosa & Azul-bebê", "acento": "#FFA6CB", "segunda": "#A8D8FF", "escuro": "#161A33",
+                      "texto": "#FFF6FB", "suave": "#D6CBE6", "pilula": "#26294A", "estilo": "fofo"},
+    "rosa_menta":    {"nome": "🍃 Rosa & Menta", "acento": "#FF9EC4", "segunda": "#9EEFD0", "escuro": "#132528",
+                      "texto": "#FFF6FA", "suave": "#CFE3DD", "pilula": "#1F3A3C", "estilo": "fofo"},
+    "rosa_dourado":  {"nome": "✨ Rosa & Dourado", "acento": "#FFB1C8", "segunda": "#F2CC8F", "escuro": "#2A141F",
+                      "texto": "#FFF6F0", "suave": "#E8CFC4", "pilula": "#3E1F2C", "estilo": "fofo"},
+    "morango":       {"nome": "🍓 Morango com Creme", "acento": "#FF6F91", "segunda": "#FFD6E2", "escuro": "#330D1C",
+                      "texto": "#FFF2F6", "suave": "#F3C4D2", "pilula": "#4A1428", "estilo": "fofo"},
+    "algodao_doce":  {"nome": "🍭 Algodão-doce", "acento": "#FF8FD0", "segunda": "#8FD3FF", "escuro": "#221433",
+                      "texto": "#FFF7FD", "suave": "#DCC8EC", "pilula": "#34204D", "estilo": "fofo"},
+    # ---- Anime fofinho ----
+    "sakura_kawaii": {"nome": "🌸 Anime: Sakura Kawaii", "acento": "#FFB7D5", "segunda": "#FFE4EF", "escuro": "#3A1E33",
+                      "texto": "#FFF7FB", "suave": "#F1CFE0", "pilula": "#52284A", "estilo": "anime"},
+    "garota_magica": {"nome": "🪄 Anime: Garota Mágica", "acento": "#FF7EC8", "segunda": "#B5F2FF", "escuro": "#2A1640",
+                      "texto": "#FFF5FD", "suave": "#DCCBF0", "pilula": "#3D2160", "estilo": "anime"},
+    "chibi_pastel":  {"nome": "🍡 Anime: Chibi Pastel", "acento": "#FFC4E1", "segunda": "#C4F0D8", "escuro": "#2E2438",
+                      "texto": "#FFF8FC", "suave": "#E6D6E8", "pilula": "#463657", "estilo": "anime"},
+    # ---- Cyberpunk ----
+    "neon_kawaii":   {"nome": "💗 Cyberpunk Kawaii", "acento": "#FF3DB8", "segunda": "#2DF6FF", "escuro": "#0B0620",
+                      "texto": "#FFF0FB", "suave": "#C9B6E8", "pilula": "#1E0F3D", "estilo": "cyber"},
+    "neon_city":     {"nome": "🌃 Cyberpunk Neon", "acento": "#F5F03A", "segunda": "#FF2E88", "escuro": "#0A0A18",
+                      "texto": "#FFFDF0", "suave": "#C9C3D8", "pilula": "#1A1A33", "estilo": "cyber"},
+    # ---- Gótico ----
+    "gotico_lolita": {"nome": "🖤 Gótico Lolita", "acento": "#E8B7D4", "segunda": "#C2275A", "escuro": "#120A10",
+                      "texto": "#FBEFF5", "suave": "#CBB3C2", "pilula": "#2A1420", "estilo": "gotico"},
+    "vampira":       {"nome": "🦇 Vampira Fofa", "acento": "#FF4D6D", "segunda": "#E6E1F0", "escuro": "#14060B",
+                      "texto": "#FFF0F3", "suave": "#D8B9C2", "pilula": "#2E0E18", "estilo": "gotico"},
+    # ---- Dark ----
+    "noite_estrelada": {"nome": "🌙 Dark: Noite Estrelada", "acento": "#B9A6FF", "segunda": "#FFE8A3", "escuro": "#070A1A",
+                      "texto": "#F4F1FF", "suave": "#B7B3D6", "pilula": "#151A36", "estilo": "dark"},
+    "abismo":        {"nome": "🌌 Dark: Abismo", "acento": "#8C7CF0", "segunda": "#6EE7F2", "escuro": "#05050A",
+                      "texto": "#EEF0FF", "suave": "#A3A6C2", "pilula": "#12122A", "estilo": "dark"},
+    # ---- Terror ----
+    "terror_fofo":   {"nome": "👻 Terror Fofo", "acento": "#FF6B8B", "segunda": "#B8F5A0", "escuro": "#100A0E",
+                      "texto": "#FFF2F5", "suave": "#D6C1C8", "pilula": "#2A1219", "estilo": "terror"},
+    "halloween":     {"nome": "🎃 Halloween Doce", "acento": "#FF9F45", "segunda": "#C59BFF", "escuro": "#160B1E",
+                      "texto": "#FFF6EC", "suave": "#DCC6D9", "pilula": "#2E1838", "estilo": "terror"},
+    # ---- Futurista ----
+    "holograma":     {"nome": "🔮 Futurista: Holograma", "acento": "#9AF7FF", "segunda": "#F7A8FF", "escuro": "#0A1024",
+                      "texto": "#F0FDFF", "suave": "#B6CBE0", "pilula": "#13213F", "estilo": "futuro"},
+    "cromado":       {"nome": "🛸 Futurista: Cromo", "acento": "#D8E3F0", "segunda": "#7DF9C6", "escuro": "#0C1118",
+                      "texto": "#FFFFFF", "suave": "#A9B6C4", "pilula": "#1B2430", "estilo": "futuro"},
+    # ---- Clássico ----
+    "classico":      {"nome": "🏆 Clássico do LoL", "acento": "#C8AA6E", "segunda": "#0AC8B9", "escuro": "#0A0E13",
+                      "texto": "#F0E6D2", "suave": "#A09B8C", "pilula": "#1A2029", "estilo": "classico"},
+}
+SIMBOLOS_ESTILO = {"fofo": "♥", "anime": "✿", "cyber": "◆", "gotico": "✝", "dark": "☾",
+                   "terror": "☠", "futuro": "◈", "classico": "★"}
+TEMA_PADRAO = "rosa_lilas"
+
+
+def _rgb(hexa: str) -> tuple[int, int, int]:
+    hexa = hexa.lstrip("#")
+    return tuple(int(hexa[i:i + 2], 16) for i in (0, 2, 4))  # type: ignore[return-value]
+
+
+def _rgba(hexa: str, alfa: int) -> tuple[int, int, int, int]:
+    return (*_rgb(hexa), max(0, min(255, int(alfa))))
+
+
+def _misturar(a: str, b: str, t: float) -> tuple[int, int, int]:
+    ra, rb = _rgb(a), _rgb(b)
+    return tuple(int(x + (y - x) * t) for x, y in zip(ra, rb))  # type: ignore[return-value]
+
+
+def _cobrir(arte: "Image.Image", largura: int, altura: int) -> "Image.Image":
+    """Corta uma imagem para preencher o tamanho (sem distorcer)."""
+    arte = arte.convert("RGB")
+    escala = max(largura / arte.width, altura / arte.height)
+    arte = arte.resize((max(1, int(arte.width * escala)), max(1, int(arte.height * escala))))
+    x = (arte.width - largura) // 2
+    y = max(0, (arte.height - altura) // 3)
+    return arte.crop((x, y, x + largura, y + altura))
+
+
+def _encaixar(dados: bytes, largura: int, altura: int) -> "Image.Image":
+    arte = Image.open(io.BytesIO(dados))
+    arte.seek(0)
+    return _cobrir(arte, largura, altura)
+
+
+def _quadros_gif(dados: bytes, largura: int, altura: int, maximo: int = 24) -> tuple[list["Image.Image"], int]:
+    """Quadros de um GIF já recortados (no máx. `maximo`, pulando quadros se precisar) + duração média."""
+    arte = Image.open(io.BytesIO(dados))
+    total = getattr(arte, "n_frames", 1)
+    passo = max(1, -(-total // maximo))
+    quadros, duracoes = [], []
+    for i in range(0, total, passo):
+        arte.seek(i)
+        quadros.append(_cobrir(arte.convert("RGBA"), largura, altura))
+        duracoes.append(int(arte.info.get("duration", 80) or 80) * passo)
+    return quadros, max(40, min(150, sum(duracoes) // max(1, len(duracoes))))
+
+
+def _veu(fundo: "Image.Image", tema: dict[str, str]) -> "Image.Image":
+    """Escurece à esquerda (texto) e dá um brilho do tema na base."""
+    L, A = fundo.size
+    veu = Image.new("L", (L, 1))
+    for x in range(L):
+        veu.putpixel((x, 0), int(238 - 165 * (x / L) ** 1.5))
+    fundo = Image.composite(Image.new("RGB", (L, A), tema["escuro"]), fundo.convert("RGB"), veu.resize((L, A)))
+    luz = Image.new("L", (1, A))
+    for y in range(A):
+        luz.putpixel((0, y), int(55 * max(0.0, (y - A * 0.55) / (A * 0.45))))
+    return Image.composite(Image.new("RGB", (L, A), tema["acento"]), fundo, luz.resize((L, A)))
+
+
+def _fundo_cores(tema: dict[str, str], L: int, A: int) -> "Image.Image":
+    cantos = Image.new("RGB", (2, 2))
+    cantos.putpixel((0, 0), _rgb(tema["escuro"]))
+    cantos.putpixel((0, 1), _misturar(tema["escuro"], tema["acento"], 0.25))
+    cantos.putpixel((1, 0), _misturar(tema["escuro"], tema["segunda"], 0.55))
+    cantos.putpixel((1, 1), _misturar(tema["escuro"], tema["acento"], 0.7))
+    return cantos.resize((L, A), Image.BILINEAR)
+
+
+def fundos_do_cartao(d: dict[str, Any], tema: dict[str, str], L: int, A: int,
+                     animado: bool = False) -> tuple[list["Image.Image"], int, bool]:
+    """(quadros do fundo já com véu, duração, só_cores). GIF só quando animado=True."""
+    if d.get("fundo_tipo") != "cores":
+        if animado and d.get("fundo_gif"):
+            try:
+                quadros, duracao = _quadros_gif(d["fundo_gif"], L, A)
+                return [_veu(q, tema) for q in quadros], duracao, False
+            except OSError:
+                pass
+        arte = d.get("fundo_imagem") or d.get("splash")
+        if arte:
+            try:
+                return [_veu(_encaixar(arte, L, A), tema)], 80, False
+            except OSError:
+                pass
+    return [_veu(_fundo_cores(tema, L, A), tema)], 80, True
+
+
+def camada_enfeites(tema: dict[str, str], so_cores: bool, semente: int, L: int, A: int) -> "Image.Image":
+    """Enfeites fixos de cada estilo, numa camada transparente."""
+    camada = Image.new("RGBA", (L, A), (0, 0, 0, 0))
+    estilo = tema.get("estilo", "fofo")
+    if estilo == "classico":
+        return camada
+    g = ImageDraw.Draw(camada)
+    acento, segunda = tema["acento"], tema["segunda"]
+    sorte = random.Random(semente)
+    forte = 1.0 if so_cores else 0.75
+    zona = (int(L * 0.70), 34, L - 46, A - 118)
+
+    def espalhar(simbolos: list[str], quantos: int, tamanhos: tuple[int, ...] = (14, 18, 22, 28)) -> None:
+        for i in range(quantos):
+            x, y = sorte.randint(zona[0], zona[2]), sorte.randint(zona[1], zona[3])
+            g.text((x, y), sorte.choice(simbolos), font=_fonte(sorte.choice(tamanhos), True),
+                   fill=_rgba(acento if i % 2 else segunda, sorte.randint(150, 235) * forte), anchor="mm")
+
+    if estilo == "fofo":
+        espalhar(["♥", "♡", "✦", "✧", "⋆"], 10 if so_cores else 6)
+    elif estilo == "anime":
+        for _ in range(16 if so_cores else 10):
+            x, y = sorte.randint(int(L * 0.72), L - 40), sorte.randint(24, A - 120)
+            w, h = sorte.randint(10, 18), sorte.randint(6, 10)
+            petala = Image.new("RGBA", (w * 2, w * 2), (0, 0, 0, 0))
+            ImageDraw.Draw(petala).ellipse((w // 2, w - h // 2, w // 2 + w, w + h // 2), fill=_rgba(acento, 200 * forte))
+            camada.alpha_composite(petala.rotate(sorte.randint(0, 180)), (x, y))
+        espalhar(["✿", "❀", "✦", "♡"], 8 if so_cores else 5)
+        g.text((L - 70, 56), "✿", font=_fonte(40, True), fill=_rgba(segunda, 230), anchor="mm")
+    elif estilo == "cyber":
+        horizonte, base = int(A * 0.62), A - 10
+        for i in range(-3, 9):
+            g.line((L * 0.84 + i * 14, horizonte, L * 0.84 + i * 60, base), fill=_rgba(segunda, 70), width=1)
+        for k in range(7):
+            yy = horizonte + (base - horizonte) * (k / 6) ** 1.8
+            g.line((L * 0.70, yy, L - 12, yy), fill=_rgba(acento, 80), width=1)
+        for yy in range(0, A, 4):
+            g.line((0, yy, L, yy), fill=(0, 0, 0, 26))
+        espalhar(["◆", "◇", "⚡", "✚"], 6, (12, 16, 20))
+        g.rectangle((L - 160, 30, L - 40, 34), fill=_rgba(acento, 220))
+        g.rectangle((L - 120, 40, L - 40, 43), fill=_rgba(segunda, 220))
+    elif estilo == "gotico":
+        for (x, y) in ((L - 44, 44), (L - 44, A // 2 - 20)):
+            g.text((x, y), "✝", font=_fonte(30, True), fill=_rgba(acento, 170), anchor="mm")
+        g.text((L - 110, 64), "☾", font=_fonte(54, True), fill=_rgba(segunda, 210), anchor="mm")
+        espalhar(["✝", "♰", "✦", "♡"], 7 if so_cores else 4, (14, 18, 22))
+        for i in range(0, L, 22):
+            g.ellipse((i, A - 22, i + 22, A + 2), outline=_rgba(acento, 90), width=2)
+    elif estilo == "dark":
+        for _ in range(70 if so_cores else 45):
+            x, y = sorte.randint(int(L * 0.45), L - 20), sorte.randint(16, A - 100)
+            r = sorte.choice([1, 1, 1, 2])
+            g.ellipse((x - r, y - r, x + r, y + r), fill=_rgba("#FFFFFF", sorte.randint(90, 230)))
+        g.text((L - 100, 78), "☾", font=_fonte(70, True), fill=_rgba(segunda, 225), anchor="mm")
+        espalhar(["✦", "⋆", "✧"], 7, (12, 16, 20))
+    elif estilo == "terror":
+        for x in range(30, L - 30, 34):
+            comp = sorte.randint(6, 26)
+            g.rounded_rectangle((x, 8, x + 9, 8 + comp), radius=4, fill=_rgba(acento, 200))
+            g.ellipse((x - 2, 4 + comp, x + 11, 17 + comp), fill=_rgba(acento, 200))
+        espalhar(["☠", "♡", "✦", "☁"], 7 if so_cores else 5, (16, 20, 26))
+        g.text((L - 90, A - 150), "☠", font=_fonte(48, True), fill=_rgba(segunda, 190), anchor="mm")
+    elif estilo == "futuro":
+        c = _rgba(acento, 210)
+        for (x, y, dx, dy) in ((24, 24, 1, 1), (L - 24, 24, -1, 1), (24, A - 24, 1, -1), (L - 24, A - 24, -1, -1)):
+            g.line((x, y, x + 46 * dx, y), fill=c, width=3)
+            g.line((x, y, x, y + 46 * dy), fill=c, width=3)
+        for _ in range(9 if so_cores else 6):
+            x, y = sorte.randint(int(L * 0.66), L - 80), sorte.randint(50, A - 140)
+            x2 = x + sorte.randint(30, 70)
+            g.line((x, y, x2, y), fill=_rgba(segunda, 150), width=2)
+            g.line((x2, y, x2 + 14, y + 14), fill=_rgba(segunda, 150), width=2)
+            g.ellipse((x - 4, y - 4, x + 4, y + 4), outline=_rgba(acento, 200), width=2)
+        for yy in range(0, A, 6):
+            g.line((int(L * 0.5), yy, L, yy), fill=_rgba(acento, 10))
+        espalhar(["◈", "⬡", "◇"], 5, (14, 18))
+    return camada
+
+
+def camada_conteudo(d: dict[str, Any], tema: dict[str, str], L: int, A: int) -> "Image.Image":
+    """Bordas, ícones, textos e medalhas numa camada transparente."""
+    acento, segunda, texto, suave = tema["acento"], tema["segunda"], tema["texto"], tema["suave"]
+    simbolo = SIMBOLOS_ESTILO.get(tema.get("estilo", "fofo"), "♥")
+    camada = Image.new("RGBA", (L, A), (0, 0, 0, 0))
+    g = ImageDraw.Draw(camada)
+    g.rounded_rectangle((6, 6, L - 7, A - 7), radius=26, outline=acento, width=4)
+    g.rounded_rectangle((14, 14, L - 15, A - 15), radius=20, outline=segunda, width=1)
+
+    if d.get("icone"):
+        try:
+            icone = Image.open(io.BytesIO(d["icone"])).convert("RGBA").resize((124, 124))
+            mascara = Image.new("L", (124, 124), 0)
+            ImageDraw.Draw(mascara).ellipse((0, 0, 123, 123), fill=255)
+            camada.paste(icone, (40, 40), mascara)
+        except OSError:
+            pass
+    g.ellipse((34, 34, 170, 170), outline=segunda, width=2)
+    g.ellipse((37, 37, 167, 167), outline=acento, width=4)
+    if d.get("nivel"):
+        rotulo = str(d["nivel"])
+        f = _fonte(18, True)
+        w = g.textlength(rotulo, font=f) + 24
+        g.rounded_rectangle((102 - w / 2, 152, 102 + w / 2, 182), radius=15, fill=tema["pilula"], outline=acento, width=2)
+        g.text((102, 167), rotulo, font=f, fill=texto, anchor="mm")
+
+    nome = d["nome"][:22]
+    f_nome = _fonte(42, True)
+    if tema.get("estilo") == "cyber":
+        g.text((193, 54), nome, font=f_nome, fill=segunda)
+        g.text((199, 58), nome, font=f_nome, fill=acento)
+    g.text((196, 56), nome, font=f_nome, fill=texto)
+    fim_nome = 196 + g.textlength(nome, font=f_nome)
+    g.text((fim_nome + 22, 70), simbolo, font=_fonte(26, True), fill=acento, anchor="mm")
+    g.text((fim_nome + 46, 58), "✦", font=_fonte(16, True), fill=segunda, anchor="mm")
+    g.text((198, 112), d["riot_id"][:32], font=_fonte(22), fill=suave)
+
+    y = 212
+    for rot, ranque in (("SOLO/DUO", d.get("solo")), ("FLEX", d.get("flex"))):
+        g.text((40, y), rot, font=_fonte(16, True), fill=segunda)
+        if ranque:
+            g.text((40, y + 22), ranque["nome"], font=_fonte(28, True), fill=CORES_TIER.get(ranque["tier"], texto))
+            g.text((40, y + 58), ranque["detalhe"], font=_fonte(18), fill=texto)
+        else:
+            g.text((40, y + 22), "Sem ranque", font=_fonte(26, True), fill=suave)
+        y += 100
+
+    x0 = 400
+    g.text((x0, 212), "PRINCIPAL", font=_fonte(16, True), fill=segunda)
+    if d.get("main_icone"):
+        try:
+            mi = Image.open(io.BytesIO(d["main_icone"])).convert("RGBA").resize((76, 76))
+            mascara = Image.new("L", (76, 76), 0)
+            ImageDraw.Draw(mascara).rounded_rectangle((0, 0, 75, 75), radius=16, fill=255)
+            camada.paste(mi, (x0, 238), mascara)
+            g.rounded_rectangle((x0 - 3, 235, x0 + 78, 316), radius=18, outline=acento, width=3)
+        except OSError:
+            pass
+    if d.get("main_nome"):
+        g.text((x0 + 94, 242), d["main_nome"][:18], font=_fonte(26, True), fill=texto)
+        g.text((x0 + 94, 278), d["main_detalhe"], font=_fonte(17), fill=suave)
+
+    est = d["internas"]
+    g.text((x0, 334), "PERSONALIZADAS DO SERVIDOR", font=_fonte(16, True), fill=segunda)
+    total = est["vitorias"] + est["derrotas"]
+    wr = round(100 * est["vitorias"] / total) if total else 0
+    g.text((x0, 356), f"{est['vitorias']}V {est['derrotas']}D", font=_fonte(28, True), fill=texto)
+    seq = est["sequencia"]
+    seq_txt = f"{seq} vitórias seguidas" if seq >= 2 else (f"{-seq} derrotas seguidas" if seq <= -2 else "")
+    g.text((x0, 392), f"{wr}% de vitórias" + (f"  •  {seq_txt}" if seq_txt else ""), font=_fonte(18), fill=suave)
+
+    outras = d.get("outras") or []
+    if outras:
+        g.text((40, A - 132), f"OUTRAS CONTAS ({len(outras)})", font=_fonte(14, True), fill=segunda)
+        f_id, f_elo = _fonte(15, True), _fonte(14, True)
+
+        def curto(rid: str, limite: int) -> str:
+            return rid if len(rid) <= limite else rid[:limite - 1] + "…"
+
+        def largura(rid: str, elo: str) -> float:
+            return 28 + g.textlength(rid, font=f_id) + 12 + g.textlength(elo, font=f_elo) + 16
+
+        # Encurta os Riot IDs até as contas caberem lado a lado.
+        limite = 20
+        while limite > 6 and sum(largura(curto(c["riot_id"], limite), c.get("elo") or "Sem ranque") + 8
+                                 for c in outras[:4]) > L - 80:
+            limite -= 1
+        cx = 40
+        for conta in outras[:4]:
+            rid = curto(conta["riot_id"], limite)
+            elo = conta.get("elo") or "Sem ranque"
+            w = largura(rid, elo)
+            if cx + w > L - 40:
+                break
+            g.rounded_rectangle((cx, A - 112, cx + w, A - 80), radius=16, fill=tema["pilula"], outline=segunda, width=1)
+            g.ellipse((cx + 12, A - 100, cx + 20, A - 92), fill=CORES_TIER.get(conta.get("tier") or "", suave))
+            g.text((cx + 28, A - 96), rid, font=f_id, fill=texto, anchor="lm")
+            g.text((cx + 28 + g.textlength(rid, font=f_id) + 12, A - 96), elo, font=f_elo,
+                   fill=CORES_TIER.get(conta.get("tier") or "", suave), anchor="lm")
+            cx += w + 8
+
+    x, y = 40, A - 64
+    for medalha in d.get("medalhas", []):
+        f = _fonte(17, True)
+        w = g.textlength(medalha, font=f) + 46
+        if x + w > L - 40:
+            break
+        g.rounded_rectangle((x, y, x + w, y + 36), radius=18, fill=tema["pilula"], outline=acento, width=2)
+        g.text((x + 18, y + 18), simbolo, font=_fonte(14, True), fill=segunda, anchor="mm")
+        g.text((x + 28, y + 18), medalha, font=f, fill=acento, anchor="lm")
+        x += w + 10
+    if not d.get("medalhas"):
+        g.text((40, y + 8), f"{simbolo} Jogue personalizadas para ganhar medalhas!", font=_fonte(17), fill=suave)
+    return camada
+
+
+def altura_do_cartao(d: dict[str, Any]) -> int:
+    return 560 if d.get("outras") else 500
+
+
+def desenhar_cartao(d: dict[str, Any]) -> bytes:
+    """Cartão estático (PNG)."""
+    L, A = 1100, altura_do_cartao(d)
+    tema = TEMAS_CARTAO.get(d.get("tema") or TEMA_PADRAO, TEMAS_CARTAO[TEMA_PADRAO])
+    quadros, _dur, so_cores = fundos_do_cartao(d, tema, L, A)
+    imagem = quadros[0].convert("RGBA")
+    imagem.alpha_composite(camada_enfeites(tema, so_cores, sum(map(ord, d.get("nome", ""))), L, A))
+    imagem.alpha_composite(camada_conteudo(d, tema, L, A))
+    saida = io.BytesIO()
+    imagem.convert("RGB").save(saida, "PNG", optimize=True)
+    return saida.getvalue()
+
+
+# ======================= EFEITOS PREMIUM (GIF animado) =======================
+EFEITOS_PREMIUM = {
+    "estrelas": "✨ Brilho Estelar",
+    "holografico": "🌈 Holográfico",
+    "coracoes": "💖 Corações Flutuantes",
+    "sakura": "🌸 Chuva de Sakura",
+    "neon": "⚡ Neon Pulsante",
+    "aurora": "🌌 Aurora Boreal",
+    "neve": "❄️ Neve Mágica",
+    "brasas": "🔥 Brasas Encantadas",
+    "diamante": "💎 Diamante",
+    "noite": "🌙 Noite Encantada",
+}
+
+
+PARTICULAS_ATRAS = {"estrelas", "coracoes", "sakura", "neve", "brasas", "noite"}
+
+
+def _compor(destino: "Image.Image", fonte: "Image.Image", x: int, y: int) -> None:
+    """alpha_composite que aceita posições fora da borda (recorta o que sobra)."""
+    x, y = int(x), int(y)
+    esq, topo = max(0, -x), max(0, -y)
+    dir_ = min(fonte.width, destino.width - x)
+    baixo = min(fonte.height, destino.height - y)
+    if dir_ <= esq or baixo <= topo:
+        return
+    destino.alpha_composite(fonte.crop((esq, topo, dir_, baixo)), (max(0, x), max(0, y)))
+
+
+def _petala(tamanho: int, cor: tuple[int, int, int, int]) -> "Image.Image":
+    p = Image.new("RGBA", (tamanho * 2, tamanho * 2), (0, 0, 0, 0))
+    ImageDraw.Draw(p).ellipse((tamanho // 2, tamanho - tamanho // 3, tamanho * 3 // 2, tamanho + tamanho // 3), fill=cor)
+    return p
+
+
+def _faixa_arco_iris(largura: int, altura: int, alfa_max: int, cores: list[str] | None = None) -> "Image.Image":
+    import colorsys
+    faixa = Image.new("RGBA", (largura, 1))
+    for x in range(largura):
+        perfil = math.sin(math.pi * x / (largura - 1))
+        if cores:
+            c = _rgb(cores[0])
+        else:
+            c = tuple(int(v * 255) for v in colorsys.hsv_to_rgb(x / largura, 0.45, 1.0))
+        faixa.putpixel((x, 0), (*c, int(alfa_max * perfil ** 2)))
+    return faixa.resize((largura, altura))
+
+
+def quadros_do_efeito(efeito: str, tema: dict[str, str], L: int, A: int, n: int,
+                      semente: int) -> list[tuple["Image.Image | None", "Image.Image | None"]]:
+    """Para cada quadro: (camada atrás do texto, camada na frente). Loop perfeito em n quadros."""
+    sorte = random.Random(semente)
+    acento, segunda = tema["acento"], tema["segunda"]
+    saida: list[tuple[Any, Any]] = []
+    vazio = lambda: Image.new("RGBA", (L, A), (0, 0, 0, 0))  # noqa: E731
+
+    if efeito == "estrelas":
+        pontos = [(sorte.randint(20, L - 20), sorte.randint(20, A - 20), sorte.choice([12, 16, 20, 26]),
+                   sorte.random(), sorte.choice([acento, segunda, "#FFFFFF"])) for _ in range(38)]
+        for i in range(n):
+            t, frente = i / n, vazio()
+            g = ImageDraw.Draw(frente)
+            for x, y, tam, fase, cor in pontos:
+                a = max(0.0, math.sin(2 * math.pi * (t + fase))) ** 2
+                if a > 0.05:
+                    r = int(tam * (0.25 + 0.25 * a))
+                    g.ellipse((x - r * 2, y - r * 2, x + r * 2, y + r * 2), fill=_rgba(cor, 40 * a))
+                    g.text((x, y), "✦", font=_fonte(int(tam * (0.6 + 0.5 * a)), True), fill=_rgba(cor, 255 * a), anchor="mm")
+            saida.append((None, frente))
+    elif efeito == "holografico":
+        faixa = _faixa_arco_iris(320, A * 2, 120).rotate(18, expand=True)
+        for i in range(n):
+            t, frente = i / n, vazio()
+            x = int(-faixa.width + (L + faixa.width * 2) * t)
+            _compor(frente, faixa, x, -A // 2)
+            # Borda furta-cor que muda de tom.
+            import colorsys
+            c = tuple(int(v * 255) for v in colorsys.hsv_to_rgb(t, 0.4, 1.0))
+            ImageDraw.Draw(frente).rounded_rectangle((6, 6, L - 7, A - 7), radius=26, outline=(*c, 200), width=4)
+            saida.append((None, frente))
+    elif efeito == "coracoes":
+        cor = [(sorte.uniform(L * 0.30, L - 30), sorte.random(), sorte.choice([1, 1, 2]), sorte.choice(["♥", "♡", "♥"]),
+                sorte.choice([16, 20, 26, 34]), sorte.choice([acento, segunda])) for _ in range(26)]
+        for i in range(n):
+            t, frente = i / n, vazio()
+            g = ImageDraw.Draw(frente)
+            for x0, fase, vel, simb, tam, c in cor:
+                p = (t * vel + fase) % 1
+                y = A + 30 - p * (A + 70)
+                x = x0 + 14 * math.sin(2 * math.pi * (p * 2 + fase))
+                alfa = 235 * min(1.0, p * 5) * min(1.0, (1 - p) * 3)
+                g.text((x, y), simb, font=_fonte(tam, True), fill=_rgba(c, alfa), anchor="mm")
+            saida.append((None, frente))
+    elif efeito == "sakura":
+        petalas = [(sorte.uniform(-150, L), sorte.random(), sorte.choice([1, 1, 2]), sorte.randint(9, 16),
+                    sorte.choice([acento, segunda, "#FFFFFF"]), sorte.random()) for _ in range(34)]
+        modelos = {(tam, c): _petala(tam, _rgba(c, 215)) for _x, _f, _v, tam, c, _g in petalas}
+        for i in range(n):
+            t, frente = i / n, vazio()
+            for x0, fase, vel, tam, c, giro in petalas:
+                p = (t * vel + fase) % 1
+                y = int(p * (A + 60) - 30)
+                x = int(x0 + 140 * p + 18 * math.sin(2 * math.pi * (p * 2 + giro)))
+                _compor(frente, modelos[(tam, c)].rotate(360 * (p * 2 + giro)), x, y)
+            saida.append((None, frente))
+    elif efeito == "neon":
+        for i in range(n):
+            t = i / n
+            pulso = 0.55 + 0.45 * math.sin(2 * math.pi * t)
+            if i in (n // 4, n // 4 + 1, int(n * 0.7)):
+                pulso *= 0.25  # piscada de lâmpada neon
+            brilho = vazio()
+            g = ImageDraw.Draw(brilho)
+            g.rounded_rectangle((8, 8, L - 9, A - 9), radius=26, outline=_rgba(acento, 255 * pulso), width=12)
+            g.rounded_rectangle((26, 26, L - 27, A - 27), radius=18, outline=_rgba(segunda, 200 * pulso), width=6)
+            brilho = brilho.filter(ImageFilter.GaussianBlur(9))
+            g2 = ImageDraw.Draw(brilho)
+            g2.rounded_rectangle((6, 6, L - 7, A - 7), radius=26, outline=_rgba("#FFFFFF", 230 * pulso), width=2)
+            saida.append((None, brilho))
+    elif efeito == "aurora":
+        for i in range(n):
+            t, tras = i / n, vazio()
+            g = ImageDraw.Draw(tras)
+            for k, cor in enumerate((acento, segunda, "#8CFFD9")):
+                pontos = []
+                for x in range(0, L + 20, 20):
+                    y = A * (0.18 + 0.1 * k) + 38 * math.sin(2 * math.pi * (x / L * 1.3 + t + k / 3))
+                    pontos.append((x, y))
+                g.line(pontos, fill=_rgba(cor, 150), width=46, joint="curve")
+            tras = tras.filter(ImageFilter.GaussianBlur(22))
+            saida.append((tras, None))
+    elif efeito == "neve":
+        flocos = [(sorte.uniform(0, L), sorte.random(), sorte.choice([1, 1, 2]), sorte.choice([2, 2, 3, 4, 0]),
+                   sorte.random()) for _ in range(70)]
+        for i in range(n):
+            t, frente = i / n, vazio()
+            g = ImageDraw.Draw(frente)
+            for x0, fase, vel, r, giro in flocos:
+                p = (t * vel + fase) % 1
+                y = p * (A + 30) - 15
+                x = x0 + 16 * math.sin(2 * math.pi * (p + giro))
+                if r == 0:
+                    g.text((x, y), "❄", font=_fonte(16, True), fill=_rgba("#FFFFFF", 210), anchor="mm")
+                else:
+                    g.ellipse((x - r, y - r, x + r, y + r), fill=_rgba("#FFFFFF", 220))
+            saida.append((None, frente))
+    elif efeito == "brasas":
+        brasas = [(sorte.uniform(L * 0.05, L - 20), sorte.random(), sorte.choice([1, 1, 2]), sorte.uniform(1.5, 4),
+                   sorte.choice([acento, "#FFB347", segunda])) for _ in range(46)]
+        for i in range(n):
+            t = i / n
+            tras, frente = vazio(), vazio()
+            gt = ImageDraw.Draw(tras)
+            pulso = 0.6 + 0.4 * math.sin(2 * math.pi * t * 2)
+            for k in range(14):
+                gt.rectangle((0, A - 14 * (k + 1), L, A - 14 * k), fill=_rgba(acento, (60 - k * 4) * pulso))
+            g = ImageDraw.Draw(frente)
+            for x0, fase, vel, r, c in brasas:
+                p = (t * vel + fase) % 1
+                y = A - p * A * 0.85
+                x = x0 + 10 * math.sin(2 * math.pi * (p * 3 + fase))
+                alfa = 255 * (1 - p) * (0.6 + 0.4 * math.sin(2 * math.pi * (t * 4 + fase)))
+                g.ellipse((x - r * 3, y - r * 3, x + r * 3, y + r * 3), fill=_rgba(c, alfa * 0.25))
+                g.ellipse((x - r, y - r, x + r, y + r), fill=_rgba(c, alfa))
+            saida.append((tras, frente))
+    elif efeito == "diamante":
+        brilho_branco = _faixa_arco_iris(90, A * 2, 150, cores=["#FFFFFF"]).rotate(22, expand=True)
+        perimetro = 2 * (L + A)
+        for i in range(n):
+            t, frente = i / n, vazio()
+            g = ImageDraw.Draw(frente)
+            for desloc in (0.0, 0.5):  # dois brilhos correndo pela borda
+                d = ((t + desloc) % 1) * perimetro
+                if d < L:
+                    x, y = d, 8
+                elif d < L + A:
+                    x, y = L - 8, d - L
+                elif d < 2 * L + A:
+                    x, y = L - (d - L - A), A - 8
+                else:
+                    x, y = 8, A - (d - 2 * L - A)
+                g.ellipse((x - 26, y - 26, x + 26, y + 26), fill=_rgba("#FFFFFF", 60))
+                g.text((x, y), "✦", font=_fonte(34, True), fill=_rgba("#FFFFFF", 255), anchor="mm")
+            xb = int(-brilho_branco.width + (L + brilho_branco.width * 2) * ((t * 1.0) % 1))
+            _compor(frente, brilho_branco, xb, -A // 2)
+            for k, (bx, by) in enumerate(((L - 90, 70), (420, 250), (90, 110), (L - 160, A - 120))):
+                a = max(0.0, math.sin(2 * math.pi * (t * 2 + k / 4))) ** 6
+                if a > 0.05:
+                    g.text((bx, by), "✦", font=_fonte(int(18 + 22 * a), True), fill=_rgba(segunda, 255 * a), anchor="mm")
+            saida.append((None, frente))
+    elif efeito == "noite":
+        estrelas = [(sorte.randint(10, L - 10), sorte.randint(10, A - 10), sorte.random(), sorte.choice([1, 1, 2]))
+                    for _ in range(110)]
+        for i in range(n):
+            t, frente = i / n, vazio()
+            g = ImageDraw.Draw(frente)
+            for x, y, fase, r in estrelas:
+                a = 0.35 + 0.65 * (0.5 + 0.5 * math.sin(2 * math.pi * (t * 2 + fase)))
+                g.ellipse((x - r, y - r, x + r, y + r), fill=_rgba("#FFFFFF", 230 * a))
+            if 0.15 <= t <= 0.55:  # estrela cadente
+                p = (t - 0.15) / 0.4
+                hx, hy = L * (0.95 - 0.45 * p), 30 + 170 * p
+                for k in range(16):
+                    tx, ty = hx + k * 9, hy - k * 3.4
+                    g.ellipse((tx - 3, ty - 3, tx + 3, ty + 3), fill=_rgba(segunda, 240 * (1 - k / 16) * (1 - p * 0.3)))
+                g.text((hx, hy), "✦", font=_fonte(24, True), fill=_rgba("#FFFFFF", 255), anchor="mm")
+            saida.append((None, frente))
+    else:
+        saida = [(None, None)] * n
+    return saida
+
+
+def desenhar_cartao_animado(d: dict[str, Any], efeito: str | None) -> bytes:
+    """Cartão premium em GIF: fundo (pode ser GIF) + efeito brilhante por cima de tudo."""
+    L, A = 1100, altura_do_cartao(d)
+    tema = TEMAS_CARTAO.get(d.get("tema") or TEMA_PADRAO, TEMAS_CARTAO[TEMA_PADRAO])
+    fundos, duracao, so_cores = fundos_do_cartao(d, tema, L, A, animado=True)
+    k = len(fundos)
+    n = k * max(1, -(-20 // k)) if k > 1 else 20
+    n = min(n, 30)
+    if k == 1:
+        duracao = 75
+    semente = sum(map(ord, d.get("nome", "")))
+    enfeites = camada_enfeites(tema, so_cores, semente, L, A)
+    conteudo = camada_conteudo(d, tema, L, A)
+    efeitos = quadros_do_efeito(efeito or "", tema, L, A, n, semente)
+
+    base_fixa = None
+    if k == 1:
+        base_fixa = fundos[0].convert("RGBA")
+    quadros = []
+    for i in range(n):
+        q = (base_fixa if base_fixa is not None else fundos[i % k].convert("RGBA")).copy()
+        tras, frente = efeitos[i]
+        if efeito in PARTICULAS_ATRAS and frente is not None:
+            tras, frente = frente, None  # partículas passam por trás dos textos
+        if tras is not None:
+            q.alpha_composite(tras)
+        q.alpha_composite(enfeites)
+        q.alpha_composite(conteudo)
+        if frente is not None:
+            q.alpha_composite(frente)
+        quadros.append(q.convert("RGB"))
+
+    for escala, cores in ((0.8, 200), (0.7, 160), (0.6, 128)):
+        tamanho = (int(L * escala), int(A * escala))
+        prontos = [q.resize(tamanho, Image.LANCZOS).quantize(colors=cores, method=Image.Quantize.FASTOCTREE,
+                                                              dither=Image.Dither.FLOYDSTEINBERG) for q in quadros]
+        saida = io.BytesIO()
+        prontos[0].save(saida, "GIF", save_all=True, append_images=prontos[1:], duration=duracao, loop=0,
+                        disposal=1, optimize=False)
+        if saida.tell() <= 7_500_000:  # Cabe no limite de envio do Discord.
+            return saida.getvalue()
+    return saida.getvalue()
+
+
+async def dados_do_cartao(guild: discord.Guild, membro: discord.Member, conta: dict[str, Any]) -> dict[str, Any]:
+    puuid = conta["puuid"]
+    versao = (await versoes_ddragon())[0]
+    base = f"https://ddragon.leagueoflegends.com/cdn/{versao}/img"
+    invocador, ranques, maestrias = await asyncio.gather(
+        chamar_riot(f"https://{RIOT_PLATAFORMA}.api.riotgames.com/lol/summoner/v4/summoners/by-puuid/{quote(puuid, safe='')}"),
+        ranques_conta(puuid), maestrias_conta(puuid), return_exceptions=True,
+    )
+    invocador = invocador if isinstance(invocador, dict) else {}
+    ranques = ranques if isinstance(ranques, list) else []
+    maestrias = maestrias if isinstance(maestrias, list) else []
+
+    def ranque(fila: str) -> dict[str, Any] | None:
+        e = next((x for x in ranques if isinstance(x, dict) and x.get("queueType") == fila), None)
+        if not e:
+            return None
+        tier = str(e.get("tier", ""))
+        divisao = "" if tier in ("MASTER", "GRANDMASTER", "CHALLENGER") else f" {e.get('rank', '')}"
+        v, dd = int(e.get("wins", 0)), int(e.get("losses", 0))
+        return {"tier": tier, "nome": f"{NOMES_TIER.get(tier, tier.title())}{divisao}",
+                "detalhe": f"{e.get('leaguePoints', 0)} PDL  •  {_porcentagem(v, v + dd)}%  •  {v}V {dd}D"}
+
+    principal = maestrias[0] if maestrias else None
+    dados = (await campeoes_completos(versao)).get("data", {})
+    por_id = {int(c["key"]): c for c in dados.values()}
+    main = por_id.get(int(principal["championId"])) if principal else None
+    estilo = estilos_perfil.get(str(membro.id), {})
+    fundo_tipo = estilo.get("fundo", "principal")
+    splash = f"https://ddragon.leagueoflegends.com/cdn/img/champion/splash/{main['id']}_0.jpg" if main else None
+    if fundo_tipo == "skin" and estilo.get("skin"):
+        splash = f"https://ddragon.leagueoflegends.com/cdn/img/champion/splash/{estilo['skin']}.jpg"
+    fundo_imagem = None
+    if fundo_tipo == "imagem":
+        try:
+            fundo_imagem = (PASTA_FUNDOS / f"{membro.id}.jpg").read_bytes()
+        except OSError:
+            fundo_imagem = None
+    downloads = {
+        "icone": f"{base}/profileicon/{invocador.get('profileIconId', 29)}.png",
+        "splash": None if fundo_tipo in ("imagem", "cores") else splash,
+        "main_icone": f"{base}/champion/{main['image']['full']}" if main else None,
+    }
+    imagens = {}
+    for chave, url in downloads.items():
+        if url:
+            try:
+                imagens[chave] = await _baixar(url, binario=True)
+            except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+                imagens[chave] = None
+    est = estatisticas_internas(guild.id, membro.id)
+    pontos_main = int(principal.get("championPoints", 0)) if principal else 0
+
+    # Outras contas do membro (até 4): Riot ID + melhor elo.
+    outras = []
+    for extra in contas_do_usuario(membro.id):
+        if extra.get("puuid") == puuid:
+            continue
+        try:
+            entradas = await ranques_conta(extra["puuid"])
+        except (ErroRiot, aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+            entradas = []
+        melhor = None
+        for fila in ("RANKED_SOLO_5x5", "RANKED_FLEX_SR"):
+            melhor = melhor or next((x for x in entradas if isinstance(x, dict) and x.get("queueType") == fila), None)
+        if melhor:
+            tier = str(melhor.get("tier", ""))
+            divisao = "" if tier in ("MASTER", "GRANDMASTER", "CHALLENGER") else f" {melhor.get('rank', '')}"
+            outras.append({"riot_id": extra.get("riot_id", "?"), "tier": tier,
+                           "elo": f"{NOMES_TIER.get(tier, tier.title())}{divisao}"})
+        else:
+            outras.append({"riot_id": extra.get("riot_id", "?"), "tier": None, "elo": "Sem ranque"})
+
+    fundo_gif = None
+    if fundo_tipo == "imagem":
+        try:
+            fundo_gif = (PASTA_FUNDOS / f"{membro.id}.gif").read_bytes()
+        except OSError:
+            fundo_gif = None
+    return {
+        "outras": outras[:4], "fundo_gif": fundo_gif, "efeito": estilo.get("efeito"),
+        **imagens, "nome": membro.display_name, "riot_id": conta.get("riot_id", ""),
+        "nivel": invocador.get("summonerLevel"), "solo": ranque("RANKED_SOLO_5x5"), "flex": ranque("RANKED_FLEX_SR"),
+        "main_nome": main["name"] if main else None,
+        "main_detalhe": f"Maestria {principal.get('championLevel', 0)}  •  {_pontos(pontos_main)} pts" if principal else "",
+        "internas": est, "medalhas": medalhas_do_membro(guild.id, membro.id, est, pontos_main),
+        "tema": estilo.get("tema"), "fundo_tipo": fundo_tipo, "fundo_imagem": fundo_imagem,
+    }
+
+
+# ------------------------------ PREMIUM ------------------------------
+# Premium = staff, quem deu boost no servidor ou quem a staff liberar com /premium dar.
+ARQUIVO_PREMIUM = Path("/data/premium.json")
+premium_liberados: dict[str, list[str]] = _carregar_json(ARQUIVO_PREMIUM, {})
+
+
+def eh_staff(membro: discord.abc.User) -> bool:
+    perms = getattr(membro, "guild_permissions", None)
+    return bool(perms and (perms.manage_channels or perms.manage_guild or perms.administrator))
+
+
+def eh_premium(membro: discord.abc.User) -> bool:
+    if not isinstance(membro, discord.Member):
+        return False
+    if eh_staff(membro) or membro.premium_since is not None:
+        return True
+    return str(membro.id) in premium_liberados.get(str(membro.guild.id), [])
+
+
+def motivo_premium(membro: discord.Member) -> str:
+    if eh_staff(membro):
+        return "staff"
+    if membro.premium_since is not None:
+        return "boost no servidor"
+    return "liberado pela staff"
+
+
+grupo_premium = app_commands.Group(name="premium", description="Cartão premium (efeitos brilhantes e fundo em GIF)",
+                                   guild_only=True)
+
+
+@grupo_premium.command(name="dar", description="Staff: libera o cartão premium para um membro")
+async def premium_dar(inter: discord.Interaction, membro: discord.Member) -> None:
+    if not await _pode_configurar(inter):
+        await inter.response.send_message("🔒 Só a staff pode liberar o premium.", ephemeral=True)
+        return
+    lista = premium_liberados.setdefault(str(inter.guild_id), [])
+    if str(membro.id) not in lista:
+        lista.append(str(membro.id))
+        _salvar_json(ARQUIVO_PREMIUM, premium_liberados)
+    await inter.response.send_message(f"💎 {membro.mention} agora tem o cartão premium! Use `/perfil_estilo`.",
+                                      allowed_mentions=discord.AllowedMentions(users=True))
+
+
+@grupo_premium.command(name="remover", description="Staff: tira o premium liberado de um membro")
+async def premium_remover(inter: discord.Interaction, membro: discord.Member) -> None:
+    if not await _pode_configurar(inter):
+        await inter.response.send_message("🔒 Só a staff pode remover o premium.", ephemeral=True)
+        return
+    lista = premium_liberados.get(str(inter.guild_id), [])
+    if str(membro.id) in lista:
+        lista.remove(str(membro.id))
+        _salvar_json(ARQUIVO_PREMIUM, premium_liberados)
+    extra = "\n-# Ele continua premium por ser staff ou dar boost." if eh_premium(membro) else ""
+    await inter.response.send_message(f"🔕 Premium liberado removido de {membro.mention}.{extra}", ephemeral=True,
+                                      allowed_mentions=discord.AllowedMentions.none())
+
+
+@grupo_premium.command(name="lista", description="Quem tem o cartão premium")
+async def premium_lista(inter: discord.Interaction) -> None:
+    guild = inter.guild
+    liberados = [f"<@{u}>" for u in premium_liberados.get(str(guild.id), [])]
+    boosters = [m.mention for m in getattr(guild, "premium_subscribers", [])]
+    texto = (f"💎 **Liberados pela staff:** {', '.join(liberados) or 'ninguém'}\n"
+             f"🚀 **Boosters:** {', '.join(boosters[:40]) or 'ninguém'}\n"
+             "🛡️ **Staff:** todos com Gerenciar Canais/Servidor")
+    await inter.response.send_message(texto[:2000], ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+
+
+bot.tree.add_command(grupo_premium)
+
+
+def conta_do_cartao(membro_id: int, conta: str | None = None) -> dict[str, Any] | None:
+    contas = contas_do_usuario(membro_id)
+    if conta:
+        return encontrar_conta_riot(contas, conta)
+    preferida = estilos_perfil.get(str(membro_id), {}).get("conta")
+    return next((c for c in contas if c.get("puuid") == preferida), None) or (contas[0] if contas else None)
+
+
+async def gerar_arquivo_cartao(guild: discord.Guild, membro: discord.Member, conta: dict[str, Any],
+                               nome: str = "perfil") -> discord.File:
+    """PNG normal ou GIF animado (premium com efeito ou fundo em GIF)."""
+    dados = await dados_do_cartao(guild, membro, conta)
+    animado = eh_premium(membro) and bool(dados.get("efeito") or dados.get("fundo_gif"))
+    if animado:
+        gif = await asyncio.to_thread(desenhar_cartao_animado, dados, dados.get("efeito"))
+        return discord.File(io.BytesIO(gif), filename=f"{nome}.gif")
+    png = await asyncio.to_thread(desenhar_cartao, dados)
+    return discord.File(io.BytesIO(png), filename=f"{nome}.png")
+
+
+@bot.tree.command(name="perfil", description="Cartão de jogador com elo, campeão principal, personalizadas e medalhas")
+@app_commands.describe(jogador="De quem é o cartão (vazio = você)", conta="Qual conta mostrar (vazio = a principal do cartão)")
+@app_commands.autocomplete(conta=autocompletar_conta_riot)
+@app_commands.guild_only()
+async def perfil(inter: discord.Interaction, jogador: discord.Member | None = None, conta: Optional[str] = None) -> None:
+    if Image is None:
+        await inter.response.send_message("⚠️ Falta instalar o Pillow no bot (veja o requirements.txt).", ephemeral=True)
+        return
+    alvo = jogador or inter.user
+    escolhida = conta_do_cartao(alvo.id, conta)
+    if escolhida is None:
+        await inter.response.send_message(f"🔗 {alvo.mention} não tem conta vinculada. Use `/link Nick#TAG`.",
+                                          ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+        return
+    destino = destino_aviso(inter.guild, "perfil")
+    await inter.response.defer(thinking=True, ephemeral=destino is not None and destino.id != inter.channel_id)
+    try:
+        arquivo = await gerar_arquivo_cartao(inter.guild, alvo, escolhida)
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, KeyError, ErroRiot, OSError) as exc:
+        log.warning("Perfil: falhou: %s", exc)
+        await inter.followup.send("⚠️ Não consegui montar o cartão agora.")
+        return
+    if destino is not None and destino.id != inter.channel_id:
+        enviado = await enviar_aviso(inter.guild, "perfil", arquivo=arquivo, membro=alvo.mention)
+        await inter.followup.send(f"📊 Cartão enviado em {destino.mention}!" if enviado else "⚠️ Não consegui enviar no canal configurado.")
+        return
+    await inter.followup.send(content=mensagem_aviso(inter.guild.id, "perfil", membro=alvo.mention),
+                              file=arquivo, allowed_mentions=MENCOES_AVISO)
+
+
+# ------------------------- /perfil_estilo -------------------------
+ARQUIVO_ESTILOS = Path("/data/perfil_estilos.json")
+PASTA_FUNDOS = Path("/data/perfil_fundos")
+estilos_perfil: dict[str, dict[str, Any]] = _carregar_json(ARQUIVO_ESTILOS, {})
+ESCOLHAS_TEMA = [app_commands.Choice(name=t["nome"], value=k) for k, t in TEMAS_CARTAO.items()]
+ESCOLHAS_FUNDO = [
+    app_commands.Choice(name="🏆 Arte do meu campeão principal", value="principal"),
+    app_commands.Choice(name="🎨 Uma skin que eu escolher", value="skin"),
+    app_commands.Choice(name="🖼️ Uma imagem que eu enviar", value="imagem"),
+    app_commands.Choice(name="🌸 Só as cores do tema", value="cores"),
+]
+
+
+async def autocompletar_campeao(inter: discord.Interaction, atual: str) -> list[app_commands.Choice[str]]:
+    try:
+        dados = (await campeoes_completos((await versoes_ddragon())[0])).get("data", {})
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+        return []
+    texto = (atual or "").casefold()
+    return [app_commands.Choice(name=c["name"], value=c["id"])
+            for c in sorted(dados.values(), key=lambda c: c["name"]) if texto in c["name"].casefold()][:25]
+
+
+async def autocompletar_skin(inter: discord.Interaction, atual: str) -> list[app_commands.Choice[str]]:
+    campeao = getattr(inter.namespace, "campeao", None)
+    if not campeao:
+        return [app_commands.Choice(name="Escolha primeiro o campeão", value="nenhuma")]
+    try:
+        dados = (await campeoes_completos((await versoes_ddragon())[0])).get("data", {})
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+        return []
+    c = dados.get(campeao)
+    if not c:
+        return []
+    texto = (atual or "").casefold()
+    saida = []
+    for skin in c.get("skins", []):
+        nome = "Visual clássico" if skin.get("name") == "default" else skin.get("name", "")
+        if texto in nome.casefold():
+            saida.append(app_commands.Choice(name=nome[:100], value=f"{c['id']}_{skin.get('num', 0)}"))
+    return saida[:25]
+
+
+def _salvar_fundo(uid: int, dados: bytes) -> bool:
+    """Salva o fundo. Devolve True se for um GIF animado."""
+    PASTA_FUNDOS.mkdir(parents=True, exist_ok=True)
+    imagem = _encaixar(dados, 1100, 500)
+    imagem.save(PASTA_FUNDOS / f"{uid}.jpg", "JPEG", quality=88)
+    animado = getattr(Image.open(io.BytesIO(dados)), "n_frames", 1) > 1
+    gif = PASTA_FUNDOS / f"{uid}.gif"
+    if animado:
+        gif.write_bytes(dados)
+    else:
+        gif.unlink(missing_ok=True)
+    return animado
+
+
+def _normalizar(texto: str) -> str:
+    import unicodedata
+    texto = unicodedata.normalize("NFKD", texto or "").encode("ascii", "ignore").decode()
+    return re.sub(r"[^a-z0-9]", "", texto.lower())
+
+
+async def achar_campeao(texto: str) -> dict[str, Any] | None:
+    dados = (await campeoes_completos((await versoes_ddragon())[0])).get("data", {})
+    alvo = _normalizar(texto)
+    if not alvo:
+        return None
+    exatos = [c for c in dados.values() if _normalizar(c["name"]) == alvo or _normalizar(c["id"]) == alvo]
+    if exatos:
+        return exatos[0]
+    comecam = [c for c in dados.values() if _normalizar(c["name"]).startswith(alvo)]
+    return comecam[0] if len(comecam) == 1 else None
+
+
+async def previa_do_estilo(guild: discord.Guild, membro: discord.Member) -> discord.File | None:
+    conta = conta_do_cartao(membro.id)
+    if conta is None or Image is None:
+        return None
+    try:
+        return await gerar_arquivo_cartao(guild, membro, conta, nome="previa")
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, KeyError, ErroRiot, OSError) as exc:
+        log.warning("Perfil: prévia falhou: %s", exc)
+        return None
+
+
+def _texto_painel(estilo: dict[str, Any], aviso: str = "", membro: discord.abc.User | None = None) -> str:
+    tema = TEMAS_CARTAO.get(estilo.get("tema") or TEMA_PADRAO, TEMAS_CARTAO[TEMA_PADRAO])["nome"]
+    fundo = {c.value: c.name for c in ESCOLHAS_FUNDO}.get(estilo.get("fundo", "principal"), "")
+    extra = ""
+    if estilo.get("fundo") == "skin" and estilo.get("skin"):
+        extra = f" ({estilo.get('skin_nome') or estilo['skin']})"
+    efeito = EFEITOS_PREMIUM.get(estilo.get("efeito") or "", "Sem efeito")
+    premium = ""
+    if membro is not None:
+        premium = (f"\n💎 Premium ativo ({motivo_premium(membro)})" if eh_premium(membro)
+                   else "\n-# 💎 Efeitos animados e fundo em GIF são premium (staff, boosters ou liberado pela staff).")
+    return (f"🎀 **Estilo do seu cartão**\nTema: **{tema}**\nFundo: **{fundo}{extra}**\nEfeito: **{efeito}**{premium}"
+            + (f"\n{aviso}" if aviso else "")
+            + "\n-# Escolha nos menus abaixo; a prévia muda na hora. As mudanças já ficam salvas.")
+
+
+class PainelEstiloView(discord.ui.View):
+    def __init__(self, dono: int, campeao: dict[str, Any] | None = None) -> None:
+        super().__init__(timeout=900)
+        self.dono = dono
+        self.campeao = campeao
+        estilo = estilos_perfil.get(str(dono), {})
+
+        temas = discord.ui.Select(placeholder="🎨 Escolha o tema de cores", row=0, options=[
+            discord.SelectOption(label=t["nome"].split(" ", 1)[1], value=k, emoji=t["nome"].split()[0],
+                                 default=(estilo.get("tema") or TEMA_PADRAO) == k)
+            for k, t in TEMAS_CARTAO.items()])
+        temas.callback = self.escolher_tema
+        self.add_item(temas)
+
+        fundos = discord.ui.Select(placeholder="🖼️ Escolha o plano de fundo", row=1, options=[
+            discord.SelectOption(label=c.name.split(" ", 1)[1], value=c.value, emoji=c.name.split()[0],
+                                 default=estilo.get("fundo", "principal") == c.value)
+            for c in ESCOLHAS_FUNDO])
+        fundos.callback = self.escolher_fundo
+        self.add_item(fundos)
+
+        efeito_atual = estilo.get("efeito") or "nenhum"
+        efeitos = discord.ui.Select(placeholder="💎 Efeito brilhante animado (premium)", row=2, options=[
+            discord.SelectOption(label="Sem efeito", value="nenhum", emoji="⭕", default=efeito_atual == "nenhum")] + [
+            discord.SelectOption(label=nome.split(" ", 1)[1], value=chave, emoji=nome.split()[0],
+                                 description="Premium • o cartão vira GIF animado",
+                                 default=efeito_atual == chave)
+            for chave, nome in EFEITOS_PREMIUM.items()])
+        efeitos.callback = self.escolher_efeito
+        self.add_item(efeitos)
+
+        contas = contas_do_usuario(dono)
+        if not campeao and len(contas) > 1:
+            principal = (conta_do_cartao(dono) or {}).get("puuid")
+            seletor_conta = discord.ui.Select(placeholder="👤 Conta principal do cartão", row=3, options=[
+                discord.SelectOption(label=c.get("riot_id", "?")[:100], value=c["puuid"][:100], emoji="👤",
+                                     default=c.get("puuid") == principal) for c in contas[:25]])
+            seletor_conta.callback = self.escolher_conta
+            self.add_item(seletor_conta)
+
+        if campeao:
+            skins = discord.ui.Select(placeholder=f"✨ Skins de {campeao['name']}", row=3, options=[
+                discord.SelectOption(
+                    label=("Visual clássico" if sk.get("name") == "default" else sk.get("name", "?"))[:100],
+                    value=f"{campeao['id']}_{sk.get('num', 0)}",
+                    default=estilo.get("skin") == f"{campeao['id']}_{sk.get('num', 0)}")
+                for sk in campeao.get("skins", [])[:25]])
+            skins.callback = self.escolher_skin
+            self.add_item(skins)
+
+        b_campeao = discord.ui.Button(label="Escolher skin de outro campeão", emoji="🔎", row=4,
+                                      style=discord.ButtonStyle.secondary)
+        b_campeao.callback = self.abrir_campeao
+        b_imagem = discord.ui.Button(label="Enviar imagem ou GIF", emoji="📤", row=4, style=discord.ButtonStyle.secondary)
+        b_imagem.callback = self.abrir_imagem
+        b_pronto = discord.ui.Button(label="Pronto", emoji="✅", row=4, style=discord.ButtonStyle.success)
+        b_pronto.callback = self.fechar
+        for b in (b_campeao, b_imagem, b_pronto):
+            self.add_item(b)
+
+    async def interaction_check(self, inter: discord.Interaction) -> bool:
+        if inter.user.id != self.dono:
+            await inter.response.send_message("🚫 Este painel é de outra pessoa. Use `/perfil_estilo`.", ephemeral=True)
+            return False
+        return True
+
+    def _salvar(self, **mudancas: Any) -> dict[str, Any]:
+        estilo = estilos_perfil.setdefault(str(self.dono), {})
+        estilo.update(mudancas)
+        _salvar_json(ARQUIVO_ESTILOS, estilos_perfil)
+        return estilo
+
+    async def atualizar(self, inter: discord.Interaction, aviso: str = "", campeao: dict[str, Any] | None = None) -> None:
+        """Salva já feito; aqui só redesenha a prévia e o painel."""
+        if not inter.response.is_done():
+            await inter.response.defer()
+        nova = PainelEstiloView(self.dono, campeao if campeao is not None else self.campeao)
+        arquivo = await previa_do_estilo(inter.guild, inter.user)
+        estilo = estilos_perfil.get(str(self.dono), {})
+        await inter.edit_original_response(
+            content=_texto_painel(estilo, aviso, inter.user), view=nova,
+            attachments=[arquivo] if arquivo else [],
+        )
+        self.stop()
+
+    async def escolher_tema(self, inter: discord.Interaction) -> None:
+        self._salvar(tema=inter.data["values"][0])
+        await self.atualizar(inter)
+
+    async def escolher_fundo(self, inter: discord.Interaction) -> None:
+        valor = inter.data["values"][0]
+        estilo = estilos_perfil.get(str(self.dono), {})
+        if valor == "imagem" and not (PASTA_FUNDOS / f"{self.dono}.jpg").exists():
+            await inter.response.send_modal(ModalImagemFundo(self))
+            return
+        if valor == "skin" and not estilo.get("skin") and not self.campeao:
+            await inter.response.send_modal(ModalCampeaoFundo(self))
+            return
+        self._salvar(fundo=valor)
+        await self.atualizar(inter)
+
+    async def escolher_efeito(self, inter: discord.Interaction) -> None:
+        valor = inter.data["values"][0]
+        if valor != "nenhum" and not eh_premium(inter.user):
+            await inter.response.send_message(
+                "💎 Os efeitos animados são **premium**: para a staff, para quem dá **boost** no servidor "
+                "ou para quem a staff liberar.", ephemeral=True)
+            return
+        self._salvar(efeito=None if valor == "nenhum" else valor)
+        await self.atualizar(inter, "✨ Gerando o cartão animado..." if valor != "nenhum" else "")
+
+    async def escolher_conta(self, inter: discord.Interaction) -> None:
+        self._salvar(conta=inter.data["values"][0])
+        await self.atualizar(inter)
+
+    async def escolher_skin(self, inter: discord.Interaction) -> None:
+        valor = inter.data["values"][0]
+        nome = next((o.label for item in self.children if isinstance(item, discord.ui.Select)
+                     for o in item.options if o.value == valor), valor)
+        self._salvar(fundo="skin", skin=valor, skin_nome=nome)
+        await self.atualizar(inter)
+
+    async def abrir_campeao(self, inter: discord.Interaction) -> None:
+        await inter.response.send_modal(ModalCampeaoFundo(self))
+
+    async def abrir_imagem(self, inter: discord.Interaction) -> None:
+        await inter.response.send_modal(ModalImagemFundo(self))
+
+    async def fechar(self, inter: discord.Interaction) -> None:
+        estilo = estilos_perfil.get(str(self.dono), {})
+        await inter.response.edit_message(
+            content=_texto_painel(estilo, "✅ Pronto! Use `/perfil` para mostrar seu cartão.", inter.user), view=None)
+        self.stop()
+
+
+class ModalCampeaoFundo(discord.ui.Modal):
+    def __init__(self, painel: PainelEstiloView) -> None:
+        super().__init__(title="Fundo com skin", timeout=300)
+        self.painel = painel
+        self.entrada = discord.ui.Label(
+            text="Nome do campeão", description="Ex.: Ahri, Neeko, Miss Fortune",
+            component=discord.ui.TextInput(placeholder="Ahri", max_length=30, required=True))
+        self.add_item(self.entrada)
+
+    async def on_submit(self, inter: discord.Interaction) -> None:
+        texto = self.entrada.component.value  # type: ignore[union-attr]
+        await inter.response.defer()
+        try:
+            campeao = await achar_campeao(texto)
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+            campeao = None
+        if campeao is None:
+            await self.painel.atualizar(inter, f"⚠️ Não achei o campeão **{discord.utils.escape_markdown(texto)}**. Tente de novo.")
+            return
+        self.painel._salvar(fundo="skin", skin=f"{campeao['id']}_0", skin_nome=f"{campeao['name']} clássico")
+        await self.painel.atualizar(inter, f"✨ Escolha a skin de **{campeao['name']}** no menu.", campeao=campeao)
+
+
+class ModalImagemFundo(discord.ui.Modal):
+    def __init__(self, painel: PainelEstiloView) -> None:
+        super().__init__(title="Imagem de fundo do cartão", timeout=300)
+        self.painel = painel
+        self.entrada = discord.ui.Label(
+            text="Selecionar imagem", description="PNG, JPG, GIF ou WEBP (até 8 MB)",
+            component=discord.ui.FileUpload(required=True, min_values=1, max_values=1))
+        self.add_item(self.entrada)
+
+    async def on_submit(self, inter: discord.Interaction) -> None:
+        upload = self.entrada.component
+        arquivos = upload.values if isinstance(upload, discord.ui.FileUpload) else []
+        await inter.response.defer()
+        if not arquivos:
+            await self.painel.atualizar(inter, "⚠️ Selecione uma imagem.")
+            return
+        anexo = arquivos[0]
+        if not (anexo.content_type or "").startswith("image/") or anexo.size > 8 * 1024 * 1024:
+            await self.painel.atualizar(inter, "⚠️ Envie uma imagem (PNG, JPG, GIF ou WEBP) de até 8 MB.")
+            return
+        try:
+            animado = await asyncio.to_thread(_salvar_fundo, inter.user.id, await anexo.read())
+        except (OSError, ValueError, discord.HTTPException) as exc:
+            log.warning("Perfil: imagem de fundo inválida: %s", exc)
+            await self.painel.atualizar(inter, "⚠️ Não consegui abrir essa imagem. Tente outra.")
+            return
+        self.painel._salvar(fundo="imagem")
+        if animado and not eh_premium(inter.user):
+            aviso = "🖼️ Imagem aplicada! 💎 GIF animado é premium, então ele aparece parado no seu cartão."
+        else:
+            aviso = "🖼️ GIF aplicado, se mexendo! ✨" if animado else "🖼️ Imagem aplicada!"
+        await self.painel.atualizar(inter, aviso)
+
+
+@bot.tree.command(name="perfil_estilo", description="Abre o painel para personalizar seu cartão do /perfil")
+@app_commands.guild_only()
+async def perfil_estilo(inter: discord.Interaction) -> None:
+    if not contas_do_usuario(inter.user.id):
+        await inter.response.send_message("🔗 Vincule uma conta com `/link Nick#TAG` para ter seu cartão.", ephemeral=True)
+        return
+    await inter.response.defer(ephemeral=True, thinking=True)
+    arquivo = await previa_do_estilo(inter.guild, inter.user)
+    estilo = estilos_perfil.get(str(inter.user.id), {})
+    kwargs: dict[str, Any] = {"content": _texto_painel(estilo, "", inter.user), "view": PainelEstiloView(inter.user.id),
+                              "ephemeral": True}
+    if arquivo:
+        kwargs["file"] = arquivo
+    await inter.followup.send(**kwargs)
+
+
+@bot.tree.command(name="perfil_fundo_remover", description="Staff: remove a imagem de fundo do cartão de um membro")
+@app_commands.describe(membro="De quem remover a imagem de fundo")
+@app_commands.guild_only()
+async def perfil_fundo_remover(inter: discord.Interaction, membro: discord.Member) -> None:
+    if not (autorizado(inter) or await pode_gerenciar_contas(inter)):
+        await inter.response.send_message("🔒 Só a staff pode remover fundos.", ephemeral=True)
+        return
+    for ext in ("jpg", "gif"):
+        try:
+            (PASTA_FUNDOS / f"{membro.id}.{ext}").unlink(missing_ok=True)
+        except OSError:
+            pass
+    estilo = estilos_perfil.get(str(membro.id))
+    if estilo and estilo.get("fundo") == "imagem":
+        estilo["fundo"] = "principal"
+        _salvar_json(ARQUIVO_ESTILOS, estilos_perfil)
+    await inter.response.send_message(f"🧹 Fundo de {membro.mention} removido.", ephemeral=True,
+                                      allowed_mentions=discord.AllowedMentions.none())
+
+
+# =====================================================================
+# ======================== Tarefas em segundo plano =====================
+# =====================================================================
+@tasks.loop(minutes=5)
+async def tarefas_extras() -> None:
+    for nome, func, a_cada in (("patch", checar_patch_novo, 1800), ("rotacao", checar_rotacao_nova, 3600),
+                               ("status", checar_status_novo, 300), ("quiz", checar_quiz_automatico, 300)):
+        ultima = _ddragon_cache.get(f"ultima:{nome}", 0)
+        if time.time() - ultima < a_cada - 5:
+            continue
+        _ddragon_cache[f"ultima:{nome}"] = time.time()
+        try:
+            await func()
+        except (ErroRiot, aiohttp.ClientError, asyncio.TimeoutError, ValueError, KeyError, OSError) as exc:
+            log.warning("Tarefa %s: %s", nome, exc)
+        except Exception:
+            log.exception("Tarefa %s: erro inesperado", nome)
+
+
+@tarefas_extras.before_loop
+async def _antes_tarefas_extras() -> None:
+    await bot.wait_until_ready()
+
+
+_extras_registrados = False
+
+
+def iniciar_recursos_extras() -> None:
+    global _extras_registrados
+    if not _extras_registrados:
+        _extras_registrados = True
+        bot.add_dynamic_items(BotaoRevanche)
+        bot.add_view(PatchSelecaoView())
+    if not tarefas_extras.is_running():
+        tarefas_extras.start()
 
 
 if __name__ == "__main__":
