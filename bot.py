@@ -6331,7 +6331,9 @@ CORES_TIER = {
 
 
 import functools
+import hashlib
 import math
+import pickle
 
 
 @functools.lru_cache(maxsize=128)
@@ -6971,7 +6973,7 @@ def desenhar_cartao_animado(d: dict[str, Any], efeito: str | None, rapido: bool 
     fundos, duracao, so_cores = fundos_do_cartao(d, tema, L, A, animado=True)
     k = len(fundos)
     n = k * max(1, -(-20 // k)) if k > 1 else 20
-    n = min(n, 16 if rapido else 30)
+    n = min(n, 16 if rapido else 24)
     if k == 1:
         duracao = 75
     semente = sum(map(ord, d.get("nome", "")))
@@ -6996,7 +6998,7 @@ def desenhar_cartao_animado(d: dict[str, Any], efeito: str | None, rapido: bool 
             q.alpha_composite(frente)
         quadros.append(q.convert("RGB"))
 
-    tentativas = ((0.55, 128), (0.45, 96)) if rapido else ((0.8, 200), (0.7, 160), (0.6, 128))
+    tentativas = ((0.55, 128), (0.45, 96)) if rapido else ((0.7, 192), (0.6, 160), (0.5, 128))
     for escala, cores in tentativas:
         tamanho = (int(L * escala), int(A * escala))
         prontos = [q.resize(tamanho, Image.LANCZOS).quantize(colors=cores, method=Image.Quantize.FASTOCTREE,
@@ -7004,7 +7006,7 @@ def desenhar_cartao_animado(d: dict[str, Any], efeito: str | None, rapido: bool 
         saida = io.BytesIO()
         prontos[0].save(saida, "GIF", save_all=True, append_images=prontos[1:], duration=duracao, loop=0,
                         disposal=1, optimize=False)
-        if saida.tell() <= (2_500_000 if rapido else 7_500_000):  # Cabe no limite de envio do Discord.
+        if saida.tell() <= (2_500_000 if rapido else 5_000_000):  # Cabe no limite de envio do Discord.
             return saida.getvalue()
     return saida.getvalue()
 
@@ -7197,16 +7199,29 @@ def conta_do_cartao(membro_id: int, conta: str | None = None) -> dict[str, Any] 
     return next((c for c in contas if c.get("puuid") == preferida), None) or (contas[0] if contas else None)
 
 
+_cartoes_prontos: dict[str, bytes] = {}
+
+
 async def gerar_arquivo_cartao(guild: discord.Guild, membro: discord.Member, conta: dict[str, Any],
                                nome: str = "perfil", estatico: bool = False, rapido: bool = False) -> discord.File:
     """PNG normal ou GIF animado (premium com efeito ou fundo em GIF). rapido = prévia leve do painel."""
     dados = await dados_do_cartao(guild, membro, conta)
     animado = not estatico and eh_premium(membro) and bool(dados.get("efeito") or dados.get("fundo_gif"))
-    if animado:
-        gif = await _desenhar(desenhar_cartao_animado, dados, dados.get("efeito"), rapido, animado=True)
-        return discord.File(io.BytesIO(gif), filename=f"{nome}.gif")
-    imagem = await _desenhar(desenhar_cartao, dados, rapido)
-    return discord.File(io.BytesIO(imagem), filename=f"{nome}.{'jpg' if rapido else 'png'}")
+    extensao = "gif" if animado else ("jpg" if rapido else "png")
+    # Cartão igual ao último desenhado (ex.: voltar para um efeito já visto) sai na hora.
+    chave = hashlib.sha1(pickle.dumps((dados, animado, rapido))).hexdigest()
+    pronto = _cartoes_prontos.get(chave)
+    if pronto is None:
+        if animado:
+            pronto = await _desenhar(desenhar_cartao_animado, dados, dados.get("efeito"), rapido, animado=True)
+        else:
+            pronto = await _desenhar(desenhar_cartao, dados, rapido)
+        _cartoes_prontos[chave] = pronto
+        while len(_cartoes_prontos) > 16:
+            _cartoes_prontos.pop(next(iter(_cartoes_prontos)))
+    else:
+        _cartoes_prontos[chave] = _cartoes_prontos.pop(chave)
+    return discord.File(io.BytesIO(pronto), filename=f"{nome}.{extensao}")
 
 
 @bot.tree.command(name="perfil", description="Cartão de jogador com elo, campeão principal, personalizadas e medalhas")
@@ -7425,24 +7440,38 @@ class PainelEstiloView(discord.ui.View):
         estilo = estilos_perfil.get(str(self.dono), {})
         tem_gif = estilo.get("fundo") == "imagem" and (PASTA_FUNDOS / f"{self.dono}.gif").exists()
         animado = eh_premium(inter.user) and bool(estilo.get("efeito") or tem_gif)
-        # 1º passo: prévia parada (rápida), para a cor/tema mudar na hora.
+
+        def antiga() -> bool:
+            return _vez_do_painel.get(self.dono) != vez  # A pessoa já escolheu outra coisa.
+
+        tarefa_gif = asyncio.ensure_future(previa_do_estilo(inter.guild, inter.user)) if animado else None
+        if tarefa_gif is not None:
+            # Se a animação fica pronta logo, troca direto por ela (uma troca só, sem "piscar").
+            feitas, _ = await asyncio.wait({tarefa_gif}, timeout=1.8)
+            if antiga():
+                tarefa_gif.cancel()
+                return
+            if feitas and tarefa_gif.result() is not None:
+                await inter.edit_original_response(content=_texto_painel(estilo, aviso, inter.user), view=nova,
+                                                   attachments=[tarefa_gif.result()])
+                self.stop()
+                return
+        # Prévia parada (rápida) enquanto a animação termina.
         arquivo = await previa_do_estilo(inter.guild, inter.user, estatico=True)
-        if _vez_do_painel.get(self.dono) != vez:
-            return  # A pessoa já escolheu outra coisa; a prévia mais nova cuida da tela.
-        espera = "✨ Gerando a animação..." if animado else ""
+        if antiga():
+            if tarefa_gif is not None:
+                tarefa_gif.cancel()
+            return
+        espera = "✨ Gerando a animação..." if tarefa_gif is not None else ""
         await inter.edit_original_response(
             content=_texto_painel(estilo, "\n".join(t for t in (aviso, espera) if t), inter.user), view=nova,
             attachments=[arquivo] if arquivo else [],
         )
         self.stop()
-        if not animado:
+        if tarefa_gif is None:
             return
-        # 2º passo: a versão animada substitui a parada quando fica pronta.
-        await asyncio.sleep(0.6)  # Se a pessoa já trocou de novo, nem começa esta animação.
-        if _vez_do_painel.get(self.dono) != vez:
-            return
-        gif = await previa_do_estilo(inter.guild, inter.user)
-        if gif is None or _vez_do_painel.get(self.dono) != vez:
+        gif = await tarefa_gif
+        if gif is None or antiga():
             return
         try:
             await inter.edit_original_response(content=_texto_painel(estilo, aviso, inter.user), attachments=[gif])
@@ -7627,6 +7656,17 @@ def iniciar_recursos_extras() -> None:
         bot.add_view(PatchSelecaoView())
     if not tarefas_extras.is_running():
         tarefas_extras.start()
+    asyncio.ensure_future(_aquecer_cartao())
+
+
+async def _aquecer_cartao() -> None:
+    """Baixa os dados grandes do Data Dragon ao ligar: o 1º /perfil não fica esperando."""
+    try:
+        versao = (await versoes_ddragon())[0]
+        await campeoes_completos(versao)
+        await nomes_campeoes()
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, KeyError) as exc:
+        log.info("Cartão: não consegui pré-carregar o Data Dragon: %s", exc)
 
 
 # =====================================================================
