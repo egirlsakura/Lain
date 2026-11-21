@@ -4824,11 +4824,17 @@ async def _conferir_resultado(guild: discord.Guild, chave: str, partida: dict[st
     if len(ordenados) > 1 and ordenados[0][1] == ordenados[1][1]:
         await _pedir_vencedor_com_botoes(guild, chave, partida)
         return
-    vencedor = ordenados[0][0]
+    await finalizar_com_vencedor(guild, chave, partida, ordenados[0][0])
 
+
+async def finalizar_com_vencedor(
+    guild: discord.Guild, chave: str, partida: dict[str, Any], vencedor: str
+) -> bool:
+    """Registra o vencedor, devolve todos, apaga os canais e anuncia. False se já acabou."""
+    canal = _canal_de_aviso(guild, partida)
     async with trava_servidor(guild.id):
-        if chave not in partidas:  # Alguém finalizou na mão enquanto isso.
-            return
+        if chave not in partidas:  # Alguém finalizou enquanto isso.
+            return False
         varias = len(partidas_do_servidor(guild.id)) > 1
         botoes = partida.get("lol_botoes_msg")
         ja = int(partida.get("lol_devolvidos") or 0)
@@ -4840,11 +4846,12 @@ async def _conferir_resultado(guild: discord.Guild, chave: str, partida: dict[st
             await guild.get_channel(botoes[0]).get_partial_message(botoes[1]).edit(
                 content=mensagem, view=None, allowed_mentions=discord.AllowedMentions.none()
             )
-            return
+            return True
         except (discord.HTTPException, AttributeError):
             pass
     if canal:
         await canal.send(mensagem, allowed_mentions=discord.AllowedMentions.none())
+    return True
 
 
 @tasks.loop(seconds=30)
@@ -5072,6 +5079,128 @@ async def teste(inter: discord.Interaction, amigo: discord.Member | None = None)
         "Para desistir do teste: `/partida_cancelar`.",
     ]
     await inter.followup.send("\n".join(linhas), allowed_mentions=discord.AllowedMentions.none())
+
+
+
+# ============== APP DO PC: VENCEDOR NA HORA (Live Client Data da Riot) ==============
+# O app "LoL Resultado" roda no PC de um jogador só enquanto estiver aberto.
+# No fim da partida ele manda, por um webhook deste servidor, o Riot ID e Win/Lose.
+# Os dados vão no NOME do webhook ("lolres Win Nick#TAG"), que o bot lê sem precisar
+# da permissão de conteúdo de mensagens. O bot então finaliza a partida da /queue.
+PREFIXO_APP = "lolres"
+
+
+@bot.tree.command(
+    name="app_resultado",
+    description="Gera o link para o app do PC que avisa o vencedor das personalizadas na hora",
+)
+@app_commands.guild_only()
+async def app_resultado(inter: discord.Interaction) -> None:
+    guild = inter.guild
+    if guild is None or not (autorizado(inter) or await pode_gerenciar_contas(inter)):
+        await inter.response.send_message(
+            "🔒 Só quem tem **Gerenciar Canais**, o dono ou o cargo autorizado.", ephemeral=True
+        )
+        return
+    canal = inter.channel
+    if not isinstance(canal, discord.TextChannel):
+        await inter.response.send_message("Use este comando em um canal de texto.", ephemeral=True)
+        return
+    if not canal.permissions_for(guild.me).manage_webhooks:
+        await inter.response.send_message(
+            f"⚠️ Preciso da permissão **Gerenciar Webhooks** em {canal.mention}.", ephemeral=True
+        )
+        return
+    await inter.response.defer(ephemeral=True, thinking=True)
+    webhooks = aovivo_config.setdefault("webhooks", {})
+    gancho = None
+    try:
+        for existente in await canal.webhooks():
+            if existente.id == webhooks.get(str(guild.id)):
+                gancho = existente
+                break
+        if gancho is None:
+            gancho = await canal.create_webhook(name="LoL Resultado", reason="/app_resultado")
+    except discord.HTTPException as exc:
+        log.warning("Não consegui criar o webhook do app: %s", exc)
+        await inter.followup.send("⚠️ Não consegui criar o webhook neste canal.", ephemeral=True)
+        return
+    webhooks[str(guild.id)] = gancho.id
+    try:
+        salvar_aovivo()
+    except OSError as exc:
+        log.exception("Não consegui salvar aovivo.json: %s", exc)
+    await inter.followup.send(
+        "🔗 **Link do app LoL Resultado** (não compartilhe fora da staff):\n"
+        f"```{gancho.url}```\n"
+        "1. Abra o app no PC (**Abrir LoL Resultado.bat**).\n"
+        "2. Cole este link no campo do app e clique em **Salvar**.\n"
+        "3. Deixe o app aberto durante a personalizada. Quando o nexus cair, "
+        "eu anuncio o vencedor e devolvo todos para a call.\n"
+        "4. Terminou de jogar? Clique em **Desligar** no app.\n\n"
+        "-# Use este comando em um canal privado da staff: o app posta lá e eu apago na hora.",
+        ephemeral=True,
+    )
+
+
+async def _processar_resultado_app(guild: discord.Guild, resultado: str, riot_id: str) -> str:
+    """Finaliza a partida da /queue do jogador que mandou o resultado pelo app."""
+    alvo = riot_id.strip().casefold()
+    uid = next(
+        (int(u) for u, reg in contas_riot.items()
+         if any(str(c.get("riot_id", "")).casefold() == alvo for c in (reg or {}).get("contas", []))),
+        None,
+    )
+    if uid is None:
+        return f"⚠️ O app mandou **{discord.utils.escape_markdown(riot_id)}**, mas essa conta não está vinculada."
+    candidatas = [
+        (chave, p) for chave, p in partidas_do_servidor(guild.id)
+        if str(uid) in (p.get("participantes") or {}) and not p.get("vencedor")
+    ]
+    if not candidatas:
+        return f"ℹ️ <@{uid}> não está em nenhuma partida da /queue em andamento."
+    # Prefere a partida já ligada a uma personalizada; senão, a mais recente.
+    chave, partida = sorted(candidatas, key=lambda item: (not item[1].get("lol_game_id"), -int(item[1].get("numero", 0))))[0]
+    meu_time = str(partida["participantes"][str(uid)].get("time", ""))
+    times = list((partida.get("canais") or {}).keys()) or ["vermelho", "azul"]
+    if resultado == "win":
+        vencedor = meu_time
+    else:
+        outros = [t for t in times if t != meu_time]
+        if len(outros) != 1:
+            await _pedir_vencedor_com_botoes(guild, chave, partida)
+            return ""
+        vencedor = outros[0]
+    await finalizar_com_vencedor(guild, chave, partida, vencedor)
+    return ""
+
+
+@bot.event
+async def on_message(message: discord.Message) -> None:
+    if message.guild is None or not message.webhook_id:
+        return
+    if aovivo_config.get("webhooks", {}).get(str(message.guild.id)) != message.webhook_id:
+        return
+    partes = (message.author.name or "").split(" ", 2)
+    try:
+        await message.delete()
+    except discord.HTTPException:
+        pass
+    if len(partes) != 3 or partes[0] != PREFIXO_APP or partes[1].lower() not in ("win", "lose"):
+        return
+    try:
+        # O "#" do Riot ID chega como "|" (o Discord não aceita "#" no nome do webhook).
+        nome, _sep, tag = partes[2].rpartition("|")
+        riot_id = f"{nome}#{tag}" if nome else partes[2]
+        aviso = await _processar_resultado_app(message.guild, partes[1].lower(), riot_id)
+    except (discord.HTTPException, ValueError, KeyError) as exc:
+        log.warning("App resultado: falha ao finalizar: %s", exc)
+        aviso = "⚠️ Recebi o resultado do app, mas não consegui finalizar a partida."
+    if aviso and isinstance(message.channel, discord.TextChannel):
+        try:
+            await message.channel.send(aviso, allowed_mentions=discord.AllowedMentions.none())
+        except discord.HTTPException:
+            pass
 
 
 if __name__ == "__main__":
