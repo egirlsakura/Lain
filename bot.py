@@ -6026,9 +6026,14 @@ async def gerar_pergunta() -> dict[str, Any]:
     return pergunta
 
 
+QUIZ_ACERTO = 10                 # Pontos por acertar
+QUIZ_BONUS = (5, 3, 1)           # Bônus para o 1º, 2º e 3º a acertar
+_jogos_quiz: dict[int, "JogoQuiz"] = {}
+
+
 class QuizView(discord.ui.View):
-    def __init__(self, pergunta: dict[str, Any]) -> None:
-        super().__init__(timeout=QUIZ_SEGUNDOS + 30)
+    def __init__(self, pergunta: dict[str, Any], segundos: int = QUIZ_SEGUNDOS) -> None:
+        super().__init__(timeout=segundos + 60)
         self.pergunta = pergunta
         self.respostas: dict[int, int] = {}
         self.ordem: list[int] = []
@@ -6048,21 +6053,8 @@ class QuizView(discord.ui.View):
             await inter.response.send_message("✅ Resposta registrada! O resultado sai em instantes.", ephemeral=True)
         return callback
 
-    def resultado(self, guild_id: int) -> str:
-        certa = self.pergunta["correta"]
-        acertaram = [u for u in self.ordem if self.respostas[u] == certa]
-        pontos = quiz_pontos.setdefault(str(guild_id), {})
-        for i, uid in enumerate(acertaram):
-            pontos[str(uid)] = pontos.get(str(uid), 0) + (2 if i == 0 else 1)
-        if acertaram:
-            _salvar_json(ARQUIVO_QUIZ, quiz_pontos)
-        rotulo = self.pergunta["opcoes"][certa][0]
-        if not acertaram:
-            return f"✅ Resposta: **{rotulo}**\n😶 Ninguém acertou dessa vez."
-        quem = f"🥇 <@{acertaram[0]}> (+2)"
-        if len(acertaram) > 1:
-            quem += " • " + ", ".join(f"<@{u}>" for u in acertaram[1:15]) + " (+1)"
-        return f"✅ Resposta: **{rotulo}**\n{quem}"
+    def acertaram(self) -> list[int]:
+        return [u for u in self.ordem if self.respostas[u] == self.pergunta["correta"]]
 
     def revelar(self) -> None:
         for i, item in enumerate(self.children):
@@ -6071,54 +6063,180 @@ class QuizView(discord.ui.View):
                 item.style = discord.ButtonStyle.success if i == self.pergunta["correta"] else discord.ButtonStyle.secondary
 
 
-async def iniciar_quiz(canal: discord.abc.Messageable, mensagem: str | None = None) -> bool:
+def _ranking_texto(placar: dict[int, int], limite: int = 10) -> str:
+    medalhas = ["🥇", "🥈", "🥉"]
+    ordem = sorted(placar.items(), key=lambda x: -x[1])
+    linhas = []
+    for i, (uid, pts) in enumerate(ordem[:limite]):
+        linhas.append(f"{medalhas[i] if i < 3 else f'`{i + 1}.`'} <@{uid}> — **{pts}** pts")
+    if len(ordem) > limite:
+        linhas.append(f"-# … e mais {len(ordem) - limite} jogador(es)")
+    return "\n".join(linhas) or "Ninguém pontuou ainda."
+
+
+class JogoQuiz:
+    """Uma partida de quiz: várias perguntas seguidas, placar e vencedor no fim."""
+
+    def __init__(self, canal: discord.abc.Messageable, total: int, segundos: int, autor_id: int | None) -> None:
+        self.canal, self.total, self.segundos, self.autor_id = canal, total, segundos, autor_id
+        self.placar: dict[int, int] = {}
+        self.acertos: dict[int, int] = {}
+        self.parar = False
+        self.pergunta_atual = 0
+
+    @property
+    def canal_id(self) -> int:
+        return getattr(self.canal, "id", 0)
+
+    async def _nova_pergunta(self) -> dict[str, Any]:
+        for tentativa in range(3):
+            try:
+                return await gerar_pergunta()
+            except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, KeyError, IndexError):
+                if tentativa == 2:
+                    raise
+                await asyncio.sleep(2)
+        raise ValueError("sem pergunta")
+
+    async def jogar(self, mensagem: str | None = None) -> None:
+        guild_id = getattr(getattr(self.canal, "guild", None), "id", 0)
+        try:
+            abertura = discord.Embed(
+                title="🎮 Quiz de LoL começando!",
+                description=(f"**{self.total} perguntas**, **{self.segundos}s** cada.\n"
+                             f"✅ Acertou: **+{QUIZ_ACERTO}** • ⚡ 1º, 2º e 3º a acertar: "
+                             f"**+{QUIZ_BONUS[0]}**, **+{QUIZ_BONUS[1]}**, **+{QUIZ_BONUS[2]}** de bônus\n"
+                             "Quem fizer mais pontos no fim **vence**! A 1ª pergunta sai em 5 segundos..."),
+                color=0xC8AA6E)
+            await self.canal.send(content=mensagem, embed=abertura, allowed_mentions=MENCOES_AVISO)
+            await asyncio.sleep(5)
+            sem_resposta = 0
+            for numero in range(1, self.total + 1):
+                if self.parar:
+                    break
+                self.pergunta_atual = numero
+                pergunta = await self._nova_pergunta()
+                view = QuizView(pergunta, self.segundos)
+                fim = int(time.time()) + self.segundos
+                embed = discord.Embed(title=f"🃏 Pergunta {numero}/{self.total}", description=pergunta["texto"],
+                                      color=0xC8AA6E)
+                if pergunta.get("imagem"):
+                    embed.set_thumbnail(url=pergunta["imagem"])
+                embed.add_field(name="⏱️ Tempo", value=f"Termina <t:{fim}:R>", inline=False)
+                msg = await self.canal.send(embed=embed, view=view)
+                # Espera o tempo acabar (ou todos que estão jogando responderem).
+                inicio = time.monotonic()
+                while time.monotonic() - inicio < self.segundos and not self.parar:
+                    await asyncio.sleep(1)
+                    if self.placar and set(self.placar) <= set(view.respostas) and len(view.respostas) >= 1:
+                        await asyncio.sleep(1)
+                        break
+                acertaram = view.acertaram()
+                for uid in view.ordem:
+                    self.placar.setdefault(uid, 0)
+                linhas = []
+                for i, uid in enumerate(acertaram):
+                    ganho = QUIZ_ACERTO + (QUIZ_BONUS[i] if i < len(QUIZ_BONUS) else 0)
+                    self.placar[uid] += ganho
+                    self.acertos[uid] = self.acertos.get(uid, 0) + 1
+                    if i < 10:
+                        linhas.append(f"{'⚡' if i < 3 else '✅'} <@{uid}> **+{ganho}**")
+                # Ranking geral do servidor (/quiz_ranking): mesma regra de sempre.
+                if acertaram:
+                    geral = quiz_pontos.setdefault(str(guild_id), {})
+                    for i, uid in enumerate(acertaram):
+                        geral[str(uid)] = geral.get(str(uid), 0) + (2 if i == 0 else 1)
+                    _salvar_json(ARQUIVO_QUIZ, quiz_pontos)
+                view.revelar()
+                view.stop()
+                rotulo = pergunta["opcoes"][pergunta["correta"]][0]
+                resultado = f"✅ Resposta: **{rotulo}**\n" + ("\n".join(linhas) if linhas else "😶 Ninguém acertou.")
+                embed.set_field_at(0, name="🏁 Resultado", value=resultado[:1024], inline=False)
+                if self.placar:
+                    embed.add_field(name="📊 Placar", value=_ranking_texto(self.placar, 5)[:1024], inline=False)
+                try:
+                    await msg.edit(embed=embed, view=view, allowed_mentions=discord.AllowedMentions.none())
+                except discord.HTTPException as exc:
+                    log.warning("Quiz: não consegui mostrar o resultado: %s", exc)
+                sem_resposta = 0 if view.respostas else sem_resposta + 1
+                if sem_resposta >= 2:
+                    await self.canal.send("😴 Duas perguntas sem ninguém responder: encerrando o quiz.")
+                    break
+                if numero < self.total and not self.parar:
+                    await asyncio.sleep(5)
+            await self._final()
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, KeyError, IndexError, discord.HTTPException) as exc:
+            log.warning("Quiz: partida interrompida: %s", exc)
+            try:
+                await self.canal.send("⚠️ O quiz teve um problema e foi encerrado.")
+                await self._final()
+            except discord.HTTPException:
+                pass
+        finally:
+            _jogos_quiz.pop(self.canal_id, None)
+            _quiz_ativo.discard(self.canal_id)
+
+    async def _final(self) -> None:
+        embed = discord.Embed(title="🏆 Fim do Quiz!", color=0xF1C40F)
+        if not self.placar or max(self.placar.values()) == 0:
+            embed.description = "Ninguém pontuou nesta partida. Tente de novo com `/quiz`!"
+        else:
+            topo = max(self.placar.values())
+            vencedores = [uid for uid, p in self.placar.items() if p == topo]
+            if len(vencedores) == 1:
+                uid = vencedores[0]
+                cabeca = (f"🎉 **Vencedor: <@{uid}>** com **{topo} pontos** "
+                          f"({self.acertos.get(uid, 0)} acerto(s))!")
+            else:
+                cabeca = "🤝 **Empate!** " + ", ".join(f"<@{u}>" for u in vencedores) + f" com **{topo} pontos**!"
+            embed.description = f"{cabeca}\n\n**Classificação final** ({len(self.placar)} jogador(es)):\n" + \
+                _ranking_texto(self.placar, 20)
+        embed.set_footer(text="Os pontos também contam no /quiz_ranking do servidor.")
+        await self.canal.send(embed=embed, allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False))
+
+
+async def iniciar_quiz(canal: discord.abc.Messageable, mensagem: str | None = None,
+                       perguntas: int = 5, segundos: int = 20, autor_id: int | None = None) -> bool:
     canal_id = getattr(canal, "id", 0)
     if canal_id in _quiz_ativo:
         return False
     _quiz_ativo.add(canal_id)
-    try:
-        pergunta = await gerar_pergunta()
-        embed = discord.Embed(title="🃏 Quiz de LoL", description=pergunta["texto"], color=0xC8AA6E)
-        if pergunta.get("imagem"):
-            embed.set_thumbnail(url=pergunta["imagem"])
-        fim = int(time.time()) + QUIZ_SEGUNDOS
-        embed.add_field(name="⏱️ Tempo", value=f"Termina <t:{fim}:R> • 1º a acertar ganha 2 pontos, os outros 1")
-        view = QuizView(pergunta)
-        msg = await canal.send(content=mensagem, embed=embed, view=view, allowed_mentions=MENCOES_AVISO)
-    except Exception:
-        _quiz_ativo.discard(canal_id)
-        raise
-
-    async def encerrar() -> None:
-        try:
-            await asyncio.sleep(QUIZ_SEGUNDOS)
-            guild_id = getattr(getattr(canal, "guild", None), "id", 0)
-            texto = view.resultado(guild_id)
-            view.revelar()
-            embed.set_field_at(0, name="🏁 Resultado", value=texto[:1024], inline=False)
-            await msg.edit(embed=embed, view=view)
-            view.stop()
-        except discord.HTTPException as exc:
-            log.warning("Quiz: não consegui encerrar: %s", exc)
-        finally:
-            _quiz_ativo.discard(canal_id)
-
-    asyncio.create_task(encerrar())
+    jogo = JogoQuiz(canal, perguntas, segundos, autor_id)
+    _jogos_quiz[canal_id] = jogo
+    asyncio.create_task(jogo.jogar(mensagem))
     return True
 
 
-@bot.tree.command(name="quiz", description="Uma pergunta de LoL valendo pontos no ranking do servidor")
+@bot.tree.command(name="quiz", description="Começa uma partida de quiz de LoL: várias perguntas e um vencedor no fim")
+@app_commands.describe(perguntas="Quantas perguntas, de 1 a 50 (se não escolher: 10)",
+                       tempo="Segundos para responder cada uma, de 10 a 60 (se não escolher: 20)")
 @app_commands.guild_only()
-async def quiz(inter: discord.Interaction) -> None:
+async def quiz(inter: discord.Interaction, perguntas: Optional[app_commands.Range[int, 1, 50]] = None,
+               tempo: Optional[app_commands.Range[int, 10, 60]] = None) -> None:
     if inter.channel_id in _quiz_ativo:
-        await inter.response.send_message("⏳ Já tem um quiz rolando neste canal!", ephemeral=True)
+        await inter.response.send_message("⏳ Já tem um quiz rolando neste canal! Use `/quiz_parar` para encerrar.",
+                                          ephemeral=True)
         return
-    await inter.response.send_message("🃏 Preparando a pergunta...", ephemeral=True)
-    try:
-        await iniciar_quiz(inter.channel)
-    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, KeyError, discord.HTTPException) as exc:
-        log.warning("Quiz: falhou: %s", exc)
-        await inter.followup.send("⚠️ Não consegui montar a pergunta agora.", ephemeral=True)
+    total = perguntas or 10
+    segundos = tempo or 20
+    await inter.response.send_message(f"🎮 Quiz com **{total} pergunta(s)** de **{segundos}s** começando!",
+                                      ephemeral=True)
+    await iniciar_quiz(inter.channel, perguntas=total, segundos=segundos, autor_id=inter.user.id)
+
+
+@bot.tree.command(name="quiz_parar", description="Encerra o quiz deste canal e mostra o vencedor")
+@app_commands.guild_only()
+async def quiz_parar(inter: discord.Interaction) -> None:
+    jogo = _jogos_quiz.get(inter.channel_id)
+    if jogo is None:
+        await inter.response.send_message("Não tem quiz rolando neste canal.", ephemeral=True)
+        return
+    if inter.user.id != jogo.autor_id and not (autorizado(inter) or await pode_gerenciar_contas(inter)):
+        await inter.response.send_message("🔒 Só quem começou o quiz ou a staff pode encerrar.", ephemeral=True)
+        return
+    jogo.parar = True
+    await inter.response.send_message("🛑 Encerrando o quiz: o vencedor sai assim que a pergunta atual terminar.",
+                                      ephemeral=True)
 
 
 @bot.tree.command(name="quiz_ranking", description="Ranking de pontos do quiz no servidor")
@@ -7005,7 +7123,8 @@ def desenhar_cartao_animado(d: dict[str, Any], efeito: str | None, rapido: bool 
     for qualidade in (92, 82, 72):
         saida = io.BytesIO()
         quadros[0].save(saida, "WEBP", save_all=True, append_images=quadros[1:], duration=duracao, loop=0,
-                        quality=qualidade, method=5 if caprichado else 0)  # caprichado: mesma qualidade, arquivo menor
+                        quality=qualidade, method=4 if caprichado else 0,  # caprichado: mesma qualidade, arquivo menor
+                        kmin=23, kmax=24)  # Só o 1º quadro é completo; os outros guardam só o que muda (bem mais rápido)
         if saida.tell() <= 8_000_000:  # Cabe no limite de envio do Discord.
             return saida.getvalue()
     return saida.getvalue()
@@ -7022,9 +7141,13 @@ async def _guardado(chave: str, fabrica: Any, validade: float) -> Any:
         return item[1]
     valor = await fabrica()
     _guardados_cartao[chave] = (agora, valor)
-    if len(_guardados_cartao) > 150:
-        for velho in sorted(_guardados_cartao, key=lambda k: _guardados_cartao[k][0])[:50]:
-            _guardados_cartao.pop(velho, None)
+    # Limite de memória: imagens guardadas somam no máximo ~25 MB (o FadeHost tem pouca RAM).
+    def peso(v: Any) -> int:
+        return len(v) if isinstance(v, (bytes, bytearray)) else 2_000
+    while len(_guardados_cartao) > 1 and (len(_guardados_cartao) > 150 or
+                                          sum(peso(v) for _, v in _guardados_cartao.values()) > 25_000_000):
+        velho = min(_guardados_cartao, key=lambda k: _guardados_cartao[k][0])
+        _guardados_cartao.pop(velho, None)
     return valor
 
 
@@ -7222,6 +7345,9 @@ def _arquivo_pronto(membro_id: int, chave: str) -> Path:
     return PASTA_CARTOES / str(membro_id) / f"{chave}.bin"
 
 
+_esperando_cartao = 0  # Quantas pessoas estão esperando um cartão agora (a preparação dá passagem).
+
+
 async def _cartao_pronto(dados: dict[str, Any], animado: bool, rapido: bool, membro_id: int,
                          caprichado: bool = False) -> bytes:
     """Cartão já feito sai na hora: memória -> arquivo salvo -> só então desenha (e salva)."""
@@ -7235,11 +7361,18 @@ async def _cartao_pronto(dados: dict[str, Any], animado: bool, rapido: bool, mem
         except OSError:
             pronto = None
     if pronto is None:
-        if animado:
-            pronto = await _desenhar(desenhar_cartao_animado, dados, dados.get("efeito"), False, caprichado,
-                                     animado=True)
-        else:
-            pronto = await _desenhar(desenhar_cartao, dados, rapido)
+        global _esperando_cartao
+        if not caprichado:
+            _esperando_cartao += 1
+        try:
+            if animado:
+                pronto = await _desenhar(desenhar_cartao_animado, dados, dados.get("efeito"), False, caprichado,
+                                         animado=True)
+            else:
+                pronto = await _desenhar(desenhar_cartao, dados, rapido)
+        finally:
+            if not caprichado:
+                _esperando_cartao -= 1
         _salvar_pronto(membro_id, arquivo, pronto)
     _cartoes_prontos[chave] = pronto
     while len(_cartoes_prontos) > 12:
@@ -7424,6 +7557,8 @@ async def _preparar(guild: discord.Guild, membro: discord.Member) -> None:
             if chave in _cdn.setdefault("links", {}):
                 continue
             async with _fila_preparo:  # Um de cada vez para o bot todo.
+                while _esperando_cartao > 0:  # Alguém está esperando um cartão: a preparação espera.
+                    await asyncio.sleep(0.5)
                 pronto = await _cartao_pronto(dados, True, True, membro.id, caprichado=True)
             _cartoes_prontos.pop(chave, None)  # Fica no arquivo; a memória fica livre.
             await guardar_cartao(guild, chave, pronto, "webp")
@@ -7804,29 +7939,105 @@ class ModalCampeaoFundo(discord.ui.Modal):
         await self.painel.atualizar(inter, f"✨ Escolha a skin de **{campeao['name']}** no menu.", campeao=campeao)
 
 
+LIMITE_FUNDO = 8 * 1024 * 1024
+
+
+class ErroLinkImagem(ValueError):
+    """Problema com o link enviado (a mensagem já explica para a pessoa)."""
+
+
+async def _endereco_publico(host: str) -> bool:
+    """Só baixa de endereços públicos da internet (nunca da rede interna do servidor)."""
+    import ipaddress
+    try:
+        infos = await asyncio.get_running_loop().getaddrinfo(host, None)
+    except OSError:
+        return False
+    return bool(infos) and all(ipaddress.ip_address(i[4][0]).is_global for i in infos)
+
+
+async def baixar_imagem_por_link(link: str) -> bytes:
+    """Baixa a imagem/GIF de um link. Aceita link direto (.gif/.png/...), Discord, Tenor e Giphy
+    (nesses, pega o GIF da página). Levanta ValueError com a explicação se não der."""
+    from urllib.parse import urlparse, urljoin
+    for _ in range(4):  # o link (e redirecionamentos); se for uma página (Tenor/Giphy), a imagem que ela indica
+        partes = urlparse(link.strip())
+        if partes.scheme not in ("http", "https") or not partes.hostname:
+            raise ErroLinkImagem("Esse link não parece válido. Use um link começando com https://")
+        if not await _endereco_publico(partes.hostname):
+            raise ErroLinkImagem("Não consigo abrir esse endereço.")
+        timeout = aiohttp.ClientTimeout(total=20)
+        async with aiohttp.ClientSession(timeout=timeout, headers={"User-Agent": "Mozilla/5.0 (LainBot)"}) as sessao:
+            async with sessao.get(link, allow_redirects=False) as resp:
+                if resp.status in (301, 302, 303, 307, 308) and resp.headers.get("Location"):
+                    link = urljoin(link, resp.headers["Location"])
+                    continue
+                if resp.status != 200:
+                    raise ErroLinkImagem(f"O link respondeu com erro ({resp.status}).")
+                tipo = resp.headers.get("Content-Type", "").lower()
+                if int(resp.headers.get("Content-Length") or 0) > LIMITE_FUNDO:
+                    raise ErroLinkImagem("Essa imagem passa de 8 MB.")
+                conteudo = bytearray()
+                async for pedaco in resp.content.iter_chunked(64 * 1024):
+                    conteudo += pedaco
+                    if len(conteudo) > LIMITE_FUNDO:
+                        raise ErroLinkImagem("Essa imagem passa de 8 MB.")
+        if tipo.startswith("image/"):
+            return bytes(conteudo)
+        if "html" in tipo:
+            pagina = conteudo.decode("utf-8", "ignore")
+            achado = None
+            for prop in ("og:image", "twitter:image", "og:image:url"):
+                m = (re.search(rf'<meta[^>]+(?:property|name)=["\']{re.escape(prop)}["\'][^>]+content=["\']([^"\']+)', pagina)
+                     or re.search(rf'<meta[^>]+content=["\']([^"\']+)["\'][^>]+(?:property|name)=["\']{re.escape(prop)}["\']', pagina))
+                if m:
+                    achado = m.group(1).replace("&amp;", "&")
+                    if ".gif" in achado.lower():
+                        break
+            if achado:
+                link = urljoin(link, achado)
+                continue
+        raise ErroLinkImagem("Esse link não leva a uma imagem. Use um link direto da imagem/GIF (ou do Tenor/Giphy).")
+    raise ErroLinkImagem("Não consegui chegar na imagem por esse link.")
+
+
 class ModalImagemFundo(discord.ui.Modal):
     def __init__(self, painel: PainelEstiloView) -> None:
-        super().__init__(title="Imagem de fundo do cartão", timeout=300)
+        super().__init__(title="Imagem ou GIF de fundo", timeout=300)
         self.painel = painel
         self.entrada = discord.ui.Label(
-            text="Selecionar imagem", description="PNG, JPG, GIF ou WEBP (até 8 MB)",
-            component=discord.ui.FileUpload(required=True, min_values=1, max_values=1))
+            text="Enviar do aparelho", description="PNG, JPG, GIF ou WEBP (até 8 MB). Ou use o link abaixo.",
+            component=discord.ui.FileUpload(required=False, min_values=0, max_values=1))
+        self.link = discord.ui.Label(
+            text="Ou cole um link", description="Link da imagem/GIF, do Discord, Tenor ou Giphy",
+            component=discord.ui.TextInput(required=False, max_length=500,
+                                           placeholder="https://tenor.com/view/... ou https://...gif"))
         self.add_item(self.entrada)
+        self.add_item(self.link)
 
     async def on_submit(self, inter: discord.Interaction) -> None:
         upload = self.entrada.component
         arquivos = upload.values if isinstance(upload, discord.ui.FileUpload) else []
+        caixa = self.link.component
+        link = (caixa.value if isinstance(caixa, discord.ui.TextInput) else "").strip()
         await inter.response.defer()
-        if not arquivos:
-            await self.painel.atualizar(inter, "⚠️ Selecione uma imagem.")
-            return
-        anexo = arquivos[0]
-        if not (anexo.content_type or "").startswith("image/") or anexo.size > 8 * 1024 * 1024:
-            await self.painel.atualizar(inter, "⚠️ Envie uma imagem (PNG, JPG, GIF ou WEBP) de até 8 MB.")
-            return
         try:
-            animado = await asyncio.to_thread(_salvar_fundo, inter.user.id, await anexo.read())
-        except (OSError, ValueError, discord.HTTPException) as exc:
+            if arquivos:
+                anexo = arquivos[0]
+                if not (anexo.content_type or "").startswith("image/") or anexo.size > LIMITE_FUNDO:
+                    await self.painel.atualizar(inter, "⚠️ Envie uma imagem (PNG, JPG, GIF ou WEBP) de até 8 MB.")
+                    return
+                conteudo = await anexo.read()
+            elif link:
+                conteudo = await baixar_imagem_por_link(link)
+            else:
+                await self.painel.atualizar(inter, "⚠️ Envie uma imagem ou cole um link.")
+                return
+            animado = await _desenhar(_salvar_fundo, inter.user.id, conteudo, animado=True)
+        except ErroLinkImagem as exc:
+            await self.painel.atualizar(inter, f"⚠️ {exc}")
+            return
+        except (OSError, ValueError, aiohttp.ClientError, asyncio.TimeoutError, discord.HTTPException) as exc:
             log.warning("Perfil: imagem de fundo inválida: %s", exc)
             await self.painel.atualizar(inter, "⚠️ Não consegui abrir essa imagem. Tente outra.")
             return
@@ -7990,13 +8201,13 @@ def _preparar_desenhista() -> None:
 
 
 async def _desenhar(funcao: Any, *args: Any, animado: bool = False) -> Any:
-    tipo = "animado" if animado else "parado"
-    ajudante = _desenhistas.get(tipo)  # A imagem parada é leve: desenha no próprio bot.
+    tipo = "animado"
+    ajudante = _desenhistas.get(tipo)  # Tudo é desenhado no processo ajudante: o bot nunca fica ocupado desenhando.
     if ajudante is not None:
         inicio = time.monotonic()
         try:
             resultado = await asyncio.wait_for(
-                asyncio.get_running_loop().run_in_executor(ajudante, _desenhar_e_liberar, funcao, *args), timeout=90)
+                asyncio.get_running_loop().run_in_executor(ajudante, _desenhar_e_liberar, funcao, *args), timeout=240)
             if time.monotonic() - inicio > 8:
                 log.info("Cartão: desenho %s levou %.1fs.", tipo, time.monotonic() - inicio)
             return resultado
@@ -8004,8 +8215,9 @@ async def _desenhar(funcao: Any, *args: Any, animado: bool = False) -> Any:
             log.warning("Cartão: processo ajudante caiu (%s); desenhando no próprio bot.", exc)
             _desenhistas[tipo] = None
         except asyncio.TimeoutError:
-            log.warning("Cartão: processo ajudante travou (%s); desenhando no próprio bot.", tipo)
-            _desenhistas[tipo] = None
+            # Fila muito grande (muita gente ao mesmo tempo): este pedido desiste, mas o ajudante continua.
+            log.warning("Cartão: pedido esperou demais na fila (%s).", tipo)
+            raise
     return await asyncio.to_thread(funcao, *args)
 
 
