@@ -5426,7 +5426,7 @@ async def avisos_testar(inter: discord.Interaction, tipo: app_commands.Choice[st
     try:
         if tipo.value == "patch":
             versao, embeds = await montar_patch()
-            ok = await enviar_aviso(inter.guild, "patch", embeds=embeds, view=PatchSelecaoView(),
+            ok = await enviar_aviso(inter.guild, "patch", embeds=embeds, view=await PatchSelecaoView.criar(),
                                     versao=".".join(nome_do_patch(versao)))
         elif tipo.value == "rotacao":
             ok = await enviar_aviso(inter.guild, "rotacao", embeds=[await montar_rotacao()],
@@ -5685,13 +5685,21 @@ class PatchSelecaoView(discord.ui.View):
     async def criar(cls) -> "PatchSelecaoView":
         try:
             return cls(await _opcoes_patch())
-        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
+            log.warning("Patch: não consegui montar a lista de atualizações: %s", exc)
             return cls()
 
     async def escolher(self, inter: discord.Interaction) -> None:
         versao = (inter.data or {}).get("values", [None])[0]
         if not versao or versao == "carregando":
-            await inter.response.send_message("Tente de novo em instantes.", ephemeral=True)
+            # Mensagem antiga, sem a lista: manda um menu novo já carregado.
+            await inter.response.defer(ephemeral=True, thinking=True)
+            view = await PatchSelecaoView.criar()
+            if any(o.value != "carregando" for o in view.seletor.options):
+                await inter.followup.send("📚 Escolha a atualização:", view=view, ephemeral=True)
+            else:
+                await inter.followup.send("⚠️ Não consegui carregar a lista agora. Tente de novo em alguns minutos.",
+                                          ephemeral=True)
             return
         await inter.response.defer(ephemeral=True, thinking=True)
         try:
@@ -5769,8 +5777,11 @@ async def montar_rotacao() -> discord.Embed:
     nomes = await nomes_campeoes()
     gratis = sorted(dados.get("freeChampionIds", []), key=lambda i: nomes.get(i, ""))
     novatos = sorted(dados.get("freeChampionIdsForNewPlayers", []), key=lambda i: nomes.get(i, ""))
+    if not gratis and not novatos:
+        log.warning("Rotação: a Riot respondeu sem campeões: %s", dados)
     embed = discord.Embed(title="🔄 Rotação grátis da semana", color=0x0AC8B9,
-                          description=" ".join(await _icones_ou_nomes(gratis))[:4000] or "—")
+                          description=" ".join(await _icones_ou_nomes(gratis))[:4000]
+                          or "⚠️ A Riot não informou a rotação desta semana. Tente de novo mais tarde.")
     if novatos:
         embed.add_field(
             name=f"🌱 Para novos jogadores (até o nível {dados.get('maxNewPlayerLevel', 10)})",
@@ -5797,6 +5808,8 @@ async def checar_rotacao_nova() -> None:
         f"https://{RIOT_PLATAFORMA}.api.riotgames.com/lol/platform/v3/champion-rotations"
     )
     atual = sorted(dados.get("freeChampionIds", []))
+    if not atual:
+        return  # Riot sem dados: não manda aviso vazio.
     estado = avisos.setdefault("_estado", {})
     if estado.get("rotacao") is None:
         estado["rotacao"] = atual  # Primeira vez: só avisa quando mudar (toda terça).
@@ -7115,9 +7128,9 @@ async def gerar_arquivo_cartao(guild: discord.Guild, membro: discord.Member, con
     dados = await dados_do_cartao(guild, membro, conta)
     animado = eh_premium(membro) and bool(dados.get("efeito") or dados.get("fundo_gif"))
     if animado:
-        gif = await asyncio.to_thread(desenhar_cartao_animado, dados, dados.get("efeito"))
+        gif = await _desenhar(desenhar_cartao_animado, dados, dados.get("efeito"))
         return discord.File(io.BytesIO(gif), filename=f"{nome}.gif")
-    png = await asyncio.to_thread(desenhar_cartao, dados)
+    png = await _desenhar(desenhar_cartao, dados)
     return discord.File(io.BytesIO(png), filename=f"{nome}.png")
 
 
@@ -7253,6 +7266,9 @@ def _texto_painel(estilo: dict[str, Any], aviso: str = "", membro: discord.abc.U
             + "\n-# Escolha nos menus abaixo; a prévia muda na hora. As mudanças já ficam salvas.")
 
 
+_vez_do_painel: dict[int, int] = {}
+
+
 class PainelEstiloView(discord.ui.View):
     def __init__(self, dono: int, campeao: dict[str, Any] | None = None) -> None:
         super().__init__(timeout=900)
@@ -7329,8 +7345,11 @@ class PainelEstiloView(discord.ui.View):
         """Salva já feito; aqui só redesenha a prévia e o painel."""
         if not inter.response.is_done():
             await inter.response.defer()
+        vez = _vez_do_painel[self.dono] = _vez_do_painel.get(self.dono, 0) + 1
         nova = PainelEstiloView(self.dono, campeao if campeao is not None else self.campeao)
         arquivo = await previa_do_estilo(inter.guild, inter.user)
+        if _vez_do_painel.get(self.dono) != vez:
+            return  # A pessoa já escolheu outra coisa; a prévia mais nova cuida da tela.
         estilo = estilos_perfil.get(str(self.dono), {})
         await inter.edit_original_response(
             content=_texto_painel(estilo, aviso, inter.user), view=nova,
@@ -7516,6 +7535,40 @@ def iniciar_recursos_extras() -> None:
         bot.add_view(PatchSelecaoView())
     if not tarefas_extras.is_running():
         tarefas_extras.start()
+
+
+# =====================================================================
+# ===== Desenho dos cartões num processo separado (o bot não trava) =====
+# =====================================================================
+import concurrent.futures as _futuros
+import multiprocessing as _multiproc
+
+_desenhista: "_futuros.ProcessPoolExecutor | None" = None
+
+
+def _preparar_desenhista() -> None:
+    """Cria 1 processo ajudante só para desenhar (criado aqui, antes do bot ligar)."""
+    global _desenhista
+    try:
+        _desenhista = _futuros.ProcessPoolExecutor(max_workers=1, mp_context=_multiproc.get_context("fork"))
+        _desenhista.submit(int).result(timeout=30)
+    except Exception as exc:  # Sem fork (ex.: Windows): desenha no próprio bot, como antes.
+        log.warning("Cartão: sem processo ajudante (%s); desenhando no próprio bot.", exc)
+        _desenhista = None
+
+
+async def _desenhar(funcao: Any, *args: Any) -> Any:
+    global _desenhista
+    if _desenhista is not None:
+        try:
+            return await asyncio.get_running_loop().run_in_executor(_desenhista, funcao, *args)
+        except _futuros.process.BrokenProcessPool as exc:
+            log.warning("Cartão: processo ajudante caiu (%s); desenhando no próprio bot.", exc)
+            _desenhista = None
+    return await asyncio.to_thread(funcao, *args)
+
+
+_preparar_desenhista()
 
 
 if __name__ == "__main__":
