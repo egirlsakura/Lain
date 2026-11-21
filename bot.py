@@ -5186,8 +5186,17 @@ async def on_message(message: discord.Message) -> None:
         await message.delete()
     except discord.HTTPException:
         pass
-    if len(partes) != 3 or partes[0] != PREFIXO_APP or partes[1].lower() not in ("win", "lose"):
+    if len(partes) == 3 and partes[0] == PREFIXO_APP and partes[1].lower() == "test":
+        log.info("App resultado: teste de conexão recebido.")
+        try:
+            await message.channel.send("✅ **App LoL Resultado conectado ao bot!**", delete_after=20)
+        except discord.HTTPException:
+            pass
         return
+    if len(partes) != 3 or partes[0] != PREFIXO_APP or partes[1].lower() not in ("win", "lose"):
+        log.info("App resultado: mensagem ignorada (%s).", message.author.name)
+        return
+    log.info("App resultado: recebido %s", message.author.name)
     try:
         # O "#" do Riot ID chega como "|" (o Discord não aceita "#" no nome do webhook).
         nome, _sep, tag = partes[2].rpartition("|")
