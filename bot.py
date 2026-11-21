@@ -7198,6 +7198,7 @@ def conta_do_cartao(membro_id: int, conta: str | None = None) -> dict[str, Any] 
 
 
 _cartoes_prontos: dict[str, bytes] = {}
+PASTA_CARTOES = Path("/data/cartoes_prontos")
 
 
 async def gerar_arquivo_cartao(guild: discord.Guild, membro: discord.Member, conta: dict[str, Any],
@@ -7206,7 +7207,27 @@ async def gerar_arquivo_cartao(guild: discord.Guild, membro: discord.Member, con
     dados = await dados_do_cartao(guild, membro, conta)
     animado = not estatico and eh_premium(membro) and bool(dados.get("efeito") or dados.get("fundo_gif"))
     extensao = "webp" if animado else ("jpg" if rapido else "png")
-    pronto = await _cartao_pronto(dados, animado, rapido)
+    chave = _chave_cartao(dados, animado, rapido)
+    salvo = PASTA_CARTOES / f"{membro.id}_{'previa' if rapido and not animado else 'cartao'}.{extensao}"
+    marca = salvo.with_suffix(salvo.suffix + ".chave")
+    pronto = _cartoes_prontos.get(chave)
+    if pronto is None:
+        try:  # Mesmo cartão de antes (nada mudou): usa o arquivo salvo, sem desenhar de novo.
+            if marca.read_text() == chave:
+                pronto = salvo.read_bytes()
+                _cartoes_prontos[chave] = pronto
+        except OSError:
+            pass
+    if pronto is None:
+        pronto = await _cartao_pronto(dados, animado, rapido)
+        try:
+            PASTA_CARTOES.mkdir(parents=True, exist_ok=True)
+            for velho in PASTA_CARTOES.glob(f"{membro.id}_{salvo.stem.split('_', 1)[1]}.*"):
+                velho.unlink(missing_ok=True)
+            salvo.write_bytes(pronto)
+            marca.write_text(chave)
+        except OSError as exc:
+            log.info("Perfil: não consegui salvar o cartão pronto: %s", exc)
     return discord.File(io.BytesIO(pronto), filename=f"{nome}.{extensao}")
 
 
@@ -7229,42 +7250,6 @@ async def _cartao_pronto(dados: dict[str, Any], animado: bool, rapido: bool) -> 
     return pronto
 
 
-_antecipando: dict[int, "asyncio.Task[None]"] = {}
-_trava_antecipacao = asyncio.Lock()
-
-
-def antecipar_efeitos(guild: discord.Guild, membro: discord.Member) -> None:
-    """Em segundo plano, já desenha o cartão com cada efeito: trocar no painel fica instantâneo."""
-    if not eh_premium(membro) or Image is None:
-        return
-    anterior = _antecipando.pop(membro.id, None)
-    if anterior is not None:
-        anterior.cancel()
-    _antecipando[membro.id] = asyncio.ensure_future(_antecipar(guild, membro))
-
-
-async def _antecipar(guild: discord.Guild, membro: discord.Member) -> None:
-    try:
-        await asyncio.sleep(1.5)  # Deixa a troca atual terminar primeiro.
-        conta = conta_do_cartao(membro.id)
-        if conta is None:
-            return
-        base = await dados_do_cartao(guild, membro, conta)
-        atual = base.get("efeito")
-        ordem = [e for e in EFEITOS_PREMIUM if e != atual]
-        for efeito in ordem:
-            dados = dict(base, efeito=efeito)
-            if _chave_cartao(dados, True, True) in _cartoes_prontos:
-                continue
-            async with _trava_antecipacao:  # Um de cada vez, para não atrasar quem está usando o bot.
-                await _cartao_pronto(dados, True, True)
-    except asyncio.CancelledError:
-        pass
-    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, KeyError, ErroRiot, OSError) as exc:
-        log.info("Perfil: não consegui pré-desenhar os efeitos: %s", exc)
-    finally:
-        if _antecipando.get(membro.id) is asyncio.current_task():
-            _antecipando.pop(membro.id, None)
 
 
 @bot.tree.command(name="perfil", description="Cartão de jogador com elo, campeão principal, personalizadas e medalhas")
@@ -7378,8 +7363,10 @@ async def previa_do_estilo(guild: discord.Guild, membro: discord.Member, estatic
         return None
     try:
         return await gerar_arquivo_cartao(guild, membro, conta, nome="previa", estatico=estatico, rapido=True)
-    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, KeyError, ErroRiot, OSError) as exc:
-        log.warning("Perfil: prévia falhou: %s", exc)
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # Qualquer falha no desenho: o painel abre mesmo assim (e o erro vai pro Console).
+        log.exception("Perfil: prévia falhou")
         return None
 
 
@@ -7498,8 +7485,6 @@ class PainelEstiloView(discord.ui.View):
                 await inter.edit_original_response(content=_texto_painel(estilo, aviso, inter.user), view=nova,
                                                    attachments=[tarefa_gif.result()])
                 self.stop()
-                if isinstance(inter.user, discord.Member):
-                    antecipar_efeitos(inter.guild, inter.user)
                 return
         # Prévia parada (rápida) enquanto a animação termina.
         arquivo = await previa_do_estilo(inter.guild, inter.user, estatico=True)
@@ -7514,8 +7499,6 @@ class PainelEstiloView(discord.ui.View):
         )
         self.stop()
         if tarefa_gif is None:
-            if isinstance(inter.user, discord.Member):
-                antecipar_efeitos(inter.guild, inter.user)
             return
         gif = await tarefa_gif
         if gif is None or antiga():
@@ -7524,8 +7507,7 @@ class PainelEstiloView(discord.ui.View):
             await inter.edit_original_response(content=_texto_painel(estilo, aviso, inter.user), attachments=[gif])
         except discord.HTTPException as exc:
             log.warning("Perfil: não consegui trocar pela prévia animada: %s", exc)
-        if isinstance(inter.user, discord.Member):
-            antecipar_efeitos(inter.guild, inter.user)
+
 
     async def escolher_tema(self, inter: discord.Interaction) -> None:
         self._salvar(tema=inter.data["values"][0])
@@ -7641,15 +7623,29 @@ async def perfil_estilo(inter: discord.Interaction) -> None:
         await inter.response.send_message("🔗 Vincule uma conta com `/link Nick#TAG` para ter seu cartão.", ephemeral=True)
         return
     await inter.response.defer(ephemeral=True, thinking=True)
-    arquivo = await previa_do_estilo(inter.guild, inter.user)
     estilo = estilos_perfil.get(str(inter.user.id), {})
-    kwargs: dict[str, Any] = {"content": _texto_painel(estilo, "", inter.user), "view": PainelEstiloView(inter.user.id),
-                              "ephemeral": True}
+    tem_gif = estilo.get("fundo") == "imagem" and (PASTA_FUNDOS / f"{inter.user.id}.gif").exists()
+    animado = eh_premium(inter.user) and bool(estilo.get("efeito") or tem_gif)
+    # Abre na hora com a prévia parada (leve); a animada entra assim que fica pronta.
+    try:
+        arquivo = await asyncio.wait_for(previa_do_estilo(inter.guild, inter.user, estatico=True), timeout=25)
+    except asyncio.TimeoutError:
+        log.warning("Perfil: prévia demorou demais; abrindo o painel sem imagem.")
+        arquivo = None
+    view = PainelEstiloView(inter.user.id)
+    kwargs: dict[str, Any] = {"content": _texto_painel(estilo, "✨ Gerando a animação..." if animado else "", inter.user),
+                              "view": view, "ephemeral": True}
     if arquivo:
         kwargs["file"] = arquivo
     await inter.followup.send(**kwargs)
-    if isinstance(inter.user, discord.Member):
-        antecipar_efeitos(inter.guild, inter.user)
+    vez = _vez_do_painel[inter.user.id] = _vez_do_painel.get(inter.user.id, 0) + 1
+    if animado:
+        animada = await previa_do_estilo(inter.guild, inter.user)
+        if animada is not None and _vez_do_painel.get(inter.user.id) == vez:
+            try:
+                await inter.edit_original_response(content=_texto_painel(estilo, "", inter.user), attachments=[animada])
+            except discord.HTTPException as exc:
+                log.warning("Perfil: não consegui trocar pela prévia animada: %s", exc)
 
 
 @bot.tree.command(name="perfil_fundo_remover", description="Staff: remove a imagem de fundo do cartão de um membro")
@@ -7746,10 +7742,18 @@ async def _desenhar(funcao: Any, *args: Any, animado: bool = False) -> Any:
     tipo = "animado" if animado else "parado"
     ajudante = _desenhistas.get(tipo)
     if ajudante is not None:
+        inicio = time.monotonic()
         try:
-            return await asyncio.get_running_loop().run_in_executor(ajudante, funcao, *args)
+            resultado = await asyncio.wait_for(
+                asyncio.get_running_loop().run_in_executor(ajudante, funcao, *args), timeout=90)
+            if time.monotonic() - inicio > 8:
+                log.info("Cartão: desenho %s levou %.1fs.", tipo, time.monotonic() - inicio)
+            return resultado
         except _futuros.process.BrokenProcessPool as exc:
             log.warning("Cartão: processo ajudante caiu (%s); desenhando no próprio bot.", exc)
+            _desenhistas[tipo] = None
+        except asyncio.TimeoutError:
+            log.warning("Cartão: processo ajudante travou (%s); desenhando no próprio bot.", tipo)
             _desenhistas[tipo] = None
     return await asyncio.to_thread(funcao, *args)
 
