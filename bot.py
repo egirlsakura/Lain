@@ -2283,6 +2283,10 @@ class FilaView(discord.ui.View):
         if inter.guild is None or not isinstance(inter.user, discord.Member):
             await inter.response.send_message("Use a fila dentro de um servidor.", ephemeral=True)
             return
+        # Primeira vez sem conta vinculada: pede o Riot ID antes de entrar.
+        if RIOT_API_KEY and not inter.user.bot and not contas_do_usuario(inter.user.id):
+            await inter.response.send_modal(ModalVincularAoEntrar(self))
+            return
         # Atualiza o elo salvo (se estiver antigo) antes de redesenhar o painel.
         await atualizar_elo_se_preciso(inter.user.id)
         async with trava_servidor(inter.guild.id):
@@ -4133,7 +4137,6 @@ async def montar_aovivo(
             embeds[0].description += (
                 "\n-# Grupos são estimados pelas partidas recentes em comum; a Riot não informa isso."
             )
-        embeds[-1].set_footer(text=AVISO_RIOT[:2048])
     caber_no_discord(embeds)
     return embeds
 
@@ -4155,6 +4158,9 @@ async def jogos_recentes(puuid: str) -> list[dict[str, Any]]:
                 raise resumo
             continue
         if isinstance(resumo, BaseException) or not resumo:
+            continue
+        if int(resumo.get("fila") or 0) == 0:
+            # Regra da Riot: histórico de personalizadas não é exibido sem consentimento.
             continue
         eu = next((x for x in resumo["participantes"] if x["puuid"] == puuid), None)
         if eu:
@@ -4558,6 +4564,379 @@ async def _antes_vigiar_aovivo() -> None:
 async def on_connect() -> None:
     if not vigiar_partidas_aovivo.is_running():
         vigiar_partidas_aovivo.start()
+    if not vigiar_personalizadas.is_running():
+        vigiar_personalizadas.start()
+
+
+
+
+# ================= VENCEDOR AUTOMÁTICO DAS PERSONALIZADAS =================
+# Quando os jogadores de uma partida interna do bot entram numa personalizada do LoL,
+# o bot liga as duas. Quando a partida do LoL termina, ele busca o resultado na Riot e
+# finaliza a partida interna com encerrar_partida(): registra o vencedor, devolve todos
+# para a call de origem e apaga os canais (igual ao /partida_finalizar).
+# /partida_finalizar e /partida_cancelar continuam funcionando normalmente.
+AUTO_MINIMO_VINCULADOS = 2         # Membros vinculados da partida que precisam estar no jogo.
+AUTO_DESISTIR_APOS = 4 * 3600      # Sem resultado depois disso, avisa para finalizar na mão.
+
+
+def _puuids_da_partida(partida: dict[str, Any]) -> dict[str, tuple[int, str]]:
+    """puuid -> (id do membro, time no bot) dos participantes com conta vinculada."""
+    resultado: dict[str, tuple[int, str]] = {}
+    for uid, cadastro in (partida.get("participantes") or {}).items():
+        for conta in (contas_riot.get(str(uid)) or {}).get("contas", []):
+            if conta.get("puuid"):
+                resultado[conta["puuid"]] = (int(uid), str((cadastro or {}).get("time", "")))
+    return resultado
+
+
+def _canal_de_aviso(guild: discord.Guild, partida: dict[str, Any]) -> discord.TextChannel | None:
+    for canal_id in (partida.get("assistir_channel_id"), aovivo_config["canais"].get(str(guild.id))):
+        canal = guild.get_channel(int(canal_id)) if canal_id else None
+        if isinstance(canal, discord.TextChannel):
+            return canal
+    return guild.system_channel
+
+
+def _nome_time(chave: str) -> str:
+    return next((f"{emoji} {nome}" for c, emoji, nome in EQUIPES if c == chave), chave)
+
+
+async def _ligar_partida_lol(guild: discord.Guild, chave: str, partida: dict[str, Any]) -> None:
+    """Procura a personalizada do LoL em que os jogadores desta partida estão."""
+    vinculados = _puuids_da_partida(partida)
+    minimo = 1 if partida.get("teste") else AUTO_MINIMO_VINCULADOS
+    if len(vinculados) < minimo:
+        return
+    for puuid in list(vinculados)[:3]:  # Basta achar um jogador na partida.
+        jogo = await partida_ativa(puuid)
+        if not jogo:
+            continue
+        personalizada = int(jogo.get("gameQueueConfigId") or 0) == 0 or jogo.get("gameType") == "CUSTOM_GAME"
+        presentes = [p for p in jogo.get("participants", []) if p.get("puuid") in vinculados]
+        if not personalizada or len(presentes) < minimo:
+            return
+        partida["lol_game_id"] = int(jogo["gameId"])
+        partida["lol_desde"] = time.time()
+        salvar_partidas()
+        canal = _canal_de_aviso(guild, partida)
+        if canal:
+            try:
+                await canal.send(
+                    f"🔗 **Partida {partida.get('numero', 1)}** ligada à personalizada do LoL. "
+                    "Quando ela acabar, eu registro o vencedor e devolvo todos para a call sozinho.",
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+            except discord.HTTPException as exc:
+                log.warning("Auto vencedor: não consegui avisar: %s", exc)
+        return
+
+
+async def _conferir_resultado(guild: discord.Guild, chave: str, partida: dict[str, Any]) -> None:
+    """Se a partida do LoL terminou, registra o vencedor e finaliza a partida interna."""
+    match_id = f"{RIOT_PLATAFORMA.upper()}_{partida['lol_game_id']}"
+    try:
+        dados = await chamar_riot(
+            f"https://{RIOT_REGIAO}.api.riotgames.com/lol/match/v5/matches/{quote(match_id, safe='')}"
+        )
+    except ErroRiot as exc:
+        if exc.status != 404:
+            raise
+        # 404: a partida ainda está em andamento (ou a Riot ainda não publicou).
+        if time.time() - float(partida.get("lol_desde") or time.time()) > AUTO_DESISTIR_APOS:
+            partida.pop("lol_game_id", None)
+            partida["lol_desistiu"] = True
+            salvar_partidas()
+            canal = _canal_de_aviso(guild, partida)
+            if canal:
+                await canal.send(
+                    f"⚠️ Não encontrei o resultado da **Partida {partida.get('numero', 1)}** na Riot. "
+                    "Finalize com `/partida_finalizar`.",
+                )
+        return
+
+    info = dados.get("info", {}) if isinstance(dados, dict) else {}
+    canal = _canal_de_aviso(guild, partida)
+    if not info.get("participants"):
+        return
+    if int(info.get("gameDuration") or 0) < 300:
+        # Remake: desfaz a ligação para detectar a próxima personalizada.
+        partida.pop("lol_game_id", None)
+        salvar_partidas()
+        if canal:
+            await canal.send(
+                f"🔁 A personalizada da **Partida {partida.get('numero', 1)}** foi refeita (remake). "
+                "Vou esperar a próxima."
+            )
+        return
+
+    vinculados = _puuids_da_partida(partida)
+    votos: dict[str, int] = {}
+    for p in info["participants"]:
+        if p.get("win") and p.get("puuid") in vinculados:
+            time_bot = vinculados[p["puuid"]][1]
+            votos[time_bot] = votos.get(time_bot, 0) + 1
+    if not votos:
+        partida.pop("lol_game_id", None)
+        partida["lol_desistiu"] = True
+        salvar_partidas()
+        if canal:
+            await canal.send(
+                f"⚠️ A personalizada da **Partida {partida.get('numero', 1)}** acabou, mas nenhum "
+                "jogador vinculado estava no time vencedor. Finalize com `/partida_finalizar`."
+            )
+        return
+    ordenados = sorted(votos.items(), key=lambda item: -item[1])
+    if len(ordenados) > 1 and ordenados[0][1] == ordenados[1][1]:
+        partida.pop("lol_game_id", None)
+        partida["lol_desistiu"] = True
+        salvar_partidas()
+        if canal:
+            await canal.send(
+                f"⚠️ Os times do LoL não batem com o sorteio da **Partida {partida.get('numero', 1)}**. "
+                "Finalize com `/partida_finalizar`."
+            )
+        return
+    vencedor = ordenados[0][0]
+
+    async with trava_servidor(guild.id):
+        if chave not in partidas:  # Alguém finalizou na mão enquanto isso.
+            return
+        varias = len(partidas_do_servidor(guild.id)) > 1
+        mensagem = await encerrar_partida(guild, chave, vencedor)
+    if not varias:
+        # Com uma partida só, o número não é necessário: começa direto pelo vencedor.
+        primeira, _sep, resto = mensagem.partition("\n")
+        if primeira.startswith("🎮") and resto:
+            mensagem = resto
+    if canal:
+        await canal.send(mensagem, allowed_mentions=discord.AllowedMentions.none())
+
+
+@tasks.loop(seconds=30)
+async def vigiar_personalizadas() -> None:
+    if not RIOT_API_KEY or not partidas:
+        return
+    for chave, partida in list(partidas.items()):
+        guild = bot.get_guild(int(partida.get("guild_id") or 0))
+        if guild is None or partida.get("vencedor") or partida.get("lol_desistiu"):
+            continue
+        try:
+            if partida.get("lol_game_id"):
+                await _conferir_resultado(guild, chave, partida)
+            else:
+                await _ligar_partida_lol(guild, chave, partida)
+        except ErroRiot as exc:
+            log.warning("Auto vencedor: %s", exc)
+            if exc.status in (0, 401, 403, 429):
+                return
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, KeyError,
+                discord.HTTPException) as exc:
+            log.warning("Auto vencedor: falha na partida %s: %s", chave, exc)
+        except Exception:
+            log.exception("Auto vencedor: erro inesperado")
+
+
+@vigiar_personalizadas.before_loop
+async def _antes_vigiar_personalizadas() -> None:
+    await bot.wait_until_ready()
+
+
+
+
+# ============ VINCULAR NO BOTÃO ENTRAR DA /queue (primeira vez) ============
+class _RespostaDepoisDoModal:
+    """Faz o botão Entrar funcionar depois da janela: responde e edita o painel da fila."""
+
+    def __init__(self, inter: discord.Interaction) -> None:
+        self._inter = inter
+
+    def is_done(self) -> bool:
+        return True
+
+    async def send_message(self, content: str | None = None, **kwargs: Any) -> None:
+        kwargs.pop("ephemeral", None)
+        await self._inter.followup.send(content, ephemeral=True, **kwargs)
+
+    async def edit_message(self, **kwargs: Any) -> None:
+        if self._inter.message is not None:
+            await self._inter.message.edit(**kwargs)
+
+
+class _InteracaoDepoisDoModal:
+    def __init__(self, inter: discord.Interaction) -> None:
+        self._inter = inter
+        self.response = _RespostaDepoisDoModal(inter)
+
+    def __getattr__(self, nome: str) -> Any:
+        return getattr(self._inter, nome)
+
+
+class ModalVincularAoEntrar(discord.ui.Modal):
+    """Aparece no primeiro clique em Entrar de quem ainda não vinculou uma conta."""
+
+    def __init__(self, view_fila: "FilaView") -> None:
+        super().__init__(title="Vincule sua conta para entrar", timeout=600)
+        self.view_fila = view_fila
+        self.entrada = discord.ui.Label(
+            text="Seu Riot ID (Nick#TAG)",
+            description="Usado no elo da fila, nas estatísticas e no vencedor das personalizadas.",
+            component=discord.ui.TextInput(
+                placeholder="Nick#BR1", min_length=5, max_length=40, required=True
+            ),
+        )
+        self.add_item(self.entrada)
+
+    async def on_submit(self, inter: discord.Interaction) -> None:
+        campo = self.entrada.component
+        assert isinstance(campo, discord.ui.TextInput)
+        separado = separar_riot_id(campo.value)
+        if separado is None:
+            await inter.response.send_message(
+                "⚠️ Use o formato **Nick#TAG** (ex: Nick#BR1). Clique em **Entrar** de novo.",
+                ephemeral=True,
+            )
+            return
+        await inter.response.defer(ephemeral=True, thinking=True)
+        try:
+            riot_nome, elo, _total = await vincular_conta_riot(inter.user.id, *separado)
+        except ErroVinculo as exc:
+            await inter.followup.send(
+                f"⚠️ {exc}\nClique em **Entrar** de novo para tentar.",
+                ephemeral=True, allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return
+        await inter.followup.send(
+            f"✅ Conta vinculada: **{discord.utils.escape_markdown(riot_nome)}** • 🏅 {elo}",
+            ephemeral=True, allowed_mentions=discord.AllowedMentions.none(),
+        )
+        # Continua exatamente como o botão Entrar faria.
+        await FilaView.entrar(self.view_fila, _InteracaoDepoisDoModal(inter), None)
+        if inter.guild is not None:
+            try:
+                await atualizar_paineis_do_jogador(inter.guild, inter.user.id)
+            except (discord.HTTPException, ValueError, KeyError) as exc:
+                log.warning("Não consegui atualizar os painéis após vincular: %s", exc)
+
+
+
+# ======================= /teste DO VENCEDOR AUTOMÁTICO =======================
+@bot.tree.command(
+    name="teste",
+    description="Cria uma partida interna de teste para conferir o vencedor automático da personalizada",
+)
+@app_commands.describe(
+    amigo="Opcional: um amigo para o outro time (vocês jogam 1x1 e ele se rende ou perde)",
+)
+@app_commands.guild_only()
+async def teste(inter: discord.Interaction, amigo: discord.Member | None = None) -> None:
+    guild = inter.guild
+    if guild is None or not (autorizado(inter) or await pode_gerenciar_contas(inter)):
+        await inter.response.send_message(
+            "🔒 Só quem tem **Gerenciar Canais**, o dono ou o cargo autorizado.", ephemeral=True
+        )
+        return
+    if not RIOT_API_KEY:
+        await inter.response.send_message("⚠️ A RIOT_API_KEY não está configurada.", ephemeral=True)
+        return
+    jogadores = [inter.user] + ([amigo] if amigo and amigo.id != inter.user.id and not amigo.bot else [])
+    sem_conta = [m for m in jogadores if not contas_do_usuario(m.id)]
+    if sem_conta:
+        await inter.response.send_message(
+            "🔗 Precisa ter conta vinculada: " + ", ".join(m.mention for m in sem_conta)
+            + ". Use `/link Nick#TAG`.",
+            ephemeral=True, allowed_mentions=discord.AllowedMentions.none(),
+        )
+        return
+    estado = getattr(inter.user, "voice", None)
+    origem = estado.channel if estado else None
+    if not isinstance(origem, discord.VoiceChannel):
+        await inter.response.send_message("🎙️ Entre em um canal de voz antes de usar o /teste.", ephemeral=True)
+        return
+    eu = guild.me
+    if eu is None or not (eu.guild_permissions.manage_channels and eu.guild_permissions.move_members):
+        await inter.response.send_message(
+            "⚠️ O bot precisa de **Gerenciar Canais** e **Mover Membros**.", ephemeral=True
+        )
+        return
+
+    await inter.response.defer(thinking=True)
+    async with trava_servidor(guild.id):
+        chave = f"teste:{inter.id}"
+        numero = numero_livre_partida(guild.id)
+        times = {"vermelho": [inter.user]}
+        if len(jogadores) > 1:
+            times["azul"] = [jogadores[1]]
+        partida: dict[str, Any] = {
+            "guild_id": guild.id,
+            "numero": numero,
+            "origem_id": origem.id,
+            "categoria_id": None,
+            "canais": {},
+            "vencedor": None,
+            "espectadores": {},
+            "assistir_channel_id": inter.channel_id,
+            "assistir_message_id": None,
+            "teste": True,
+            "participantes": {
+                str(m.id): {"origem_id": origem.id, "time": time_chave}
+                for time_chave, membros in times.items() for m in membros
+            },
+        }
+        partidas[chave] = partida
+        salvar_partidas()
+        try:
+            categoria = await guild.create_category(
+                f"🧪 TESTE {numero} EM ANDAMENTO", reason="/teste do vencedor automático"
+            )
+            partida["categoria_id"] = categoria.id
+            salvar_partidas()
+            for time_chave, membros in times.items():
+                emoji, nome = next((e, n) for c, e, n in EQUIPES if c == time_chave)
+                canal = await guild.create_voice_channel(
+                    f"{emoji} Time {nome} 🔒", category=categoria,
+                    overwrites=permissoes_de_time(guild, eu, membros),
+                    reason="/teste do vencedor automático",
+                )
+                partida["canais"][time_chave] = canal.id
+                salvar_partidas()
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            log.exception("Falha ao criar a partida de teste: %s", exc)
+            await remover_estrutura(guild, partida)
+            partidas.pop(chave, None)
+            salvar_partidas()
+            await inter.followup.send("❌ Não consegui criar os canais do teste. Confira as permissões.")
+            return
+
+        movidos = 0
+        for time_chave, membros in times.items():
+            destino = buscar_voz(guild, partida["canais"][time_chave])
+            for membro in membros:
+                if membro.voice and membro.voice.channel and destino:
+                    try:
+                        await membro.move_to(destino, reason="/teste do vencedor automático")
+                        movidos += 1
+                    except (discord.Forbidden, discord.HTTPException) as exc:
+                        log.warning("Teste: não consegui mover %s: %s", membro.id, exc)
+
+    linhas = [
+        f"🧪 **Partida de teste {numero} criada** ({movidos} movido(s)).",
+        "🔴 Time Vermelho: " + inter.user.mention,
+    ]
+    if len(jogadores) > 1:
+        linhas.append("🔵 Time Azul: " + jogadores[1].mention)
+    linhas += [
+        "",
+        "**Agora:**",
+        "1. Crie uma **partida personalizada** no LoL"
+        + (" com o seu amigo no time adversário." if len(jogadores) > 1 else " (pode ser contra bots)."),
+        "2. Quando abrir a tela de carregamento, em até 30 s eu aviso aqui que liguei a partida.",
+        "3. Jogue **mais de 5 minutos** (antes disso a Riot conta como remake) e termine a partida.",
+        "4. Em alguns minutos após o fim, eu anuncio o vencedor aqui e devolvo todos para a call.",
+        "",
+        "Para desistir do teste: `/partida_cancelar`.",
+    ]
+    await inter.followup.send("\n".join(linhas), allowed_mentions=discord.AllowedMentions.none())
 
 
 if __name__ == "__main__":
