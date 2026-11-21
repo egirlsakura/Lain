@@ -7200,7 +7200,7 @@ def conta_do_cartao(membro_id: int, conta: str | None = None) -> dict[str, Any] 
 
 _cartoes_prontos: dict[str, bytes] = {}
 PASTA_CARTOES = Path("/data/cartoes_prontos")
-CARTOES_POR_MEMBRO = 30  # Quantos cartões prontos ficam salvos por pessoa (≈15 MB no máximo).
+CARTOES_POR_MEMBRO = 45  # Quantos cartões prontos ficam salvos por pessoa (≈25 MB no máximo).
 
 
 async def gerar_arquivo_cartao(guild: discord.Guild, membro: discord.Member, conta: dict[str, Any],
@@ -7278,11 +7278,14 @@ async def _preparar(guild: discord.Guild, membro: discord.Member) -> None:
         if conta is None:
             return
         base = await dados_do_cartao(guild, membro, conta)
-        atual = base.get("efeito")
-        for efeito in [atual] + [e for e in EFEITOS_PREMIUM if e != atual]:
-            if not efeito:
-                continue
-            dados = dict(base, efeito=efeito)
+        atual, tema_atual = base.get("efeito"), base.get("tema")  # (None = tema padrão, como está salvo)
+        # 1º: os 10 efeitos no tema atual (trocar efeito = instantâneo);
+        # 2º: o efeito atual em todos os temas (trocar cor/tema com o efeito rodando = instantâneo).
+        combinacoes = [(tema_atual, e) for e in EFEITOS_PREMIUM]
+        if atual:
+            combinacoes += [(t, atual) for t in TEMAS_CARTAO if t != tema_atual]
+        for tema, efeito in combinacoes:
+            dados = dict(base, efeito=efeito, tema=tema)
             chave = _chave_cartao(dados, True, True)
             if chave in _cartoes_prontos or _arquivo_pronto(membro.id, chave).exists():
                 continue
