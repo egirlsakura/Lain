@@ -7558,7 +7558,8 @@ async def previa_do_estilo(guild: discord.Guild, membro: discord.Member, estatic
         return None
 
 
-def _texto_painel(estilo: dict[str, Any], aviso: str = "", membro: discord.abc.User | None = None) -> str:
+def _texto_painel(estilo: dict[str, Any], aviso: str = "", membro: discord.abc.User | None = None,
+                  menus: bool = True) -> str:
     tema = TEMAS_CARTAO.get(estilo.get("tema") or TEMA_PADRAO, TEMAS_CARTAO[TEMA_PADRAO])["nome"]
     fundo = {c.value: c.name for c in ESCOLHAS_FUNDO}.get(estilo.get("fundo", "principal"), "")
     extra = ""
@@ -7571,10 +7572,42 @@ def _texto_painel(estilo: dict[str, Any], aviso: str = "", membro: discord.abc.U
                    else "\n-# 💎 Efeitos animados e fundo em GIF são premium (staff, boosters ou liberado pela staff).")
     return (f"🎀 **Estilo do seu cartão**\nTema: **{tema}**\nFundo: **{fundo}{extra}**\nEfeito: **{efeito}**{premium}"
             + (f"\n{aviso}" if aviso else "")
-            + "\n-# Escolha nos menus abaixo; a prévia muda na hora. As mudanças já ficam salvas.")
+            + ("\n-# Escolha nos menus abaixo; a prévia muda na hora. As mudanças já ficam salvas." if menus else ""))
 
 
 _vez_do_painel: dict[int, int] = {}
+
+
+async def ver_tamanho_real(inter: discord.Interaction) -> None:
+    """Mostra (só para a pessoa) o cartão do jeito que o /perfil envia, em tamanho real."""
+    conta = conta_do_cartao(inter.user.id)
+    if conta is None or not isinstance(inter.user, discord.Member):
+        await inter.response.send_message("🔗 Vincule uma conta com `/link Nick#TAG` para ter seu cartão.", ephemeral=True)
+        return
+    await inter.response.defer(ephemeral=True, thinking=True)
+    try:
+        arquivo = await gerar_arquivo_cartao(inter.guild, inter.user, conta, rapido=True)
+        if arquivo.filename.endswith(".jpg"):  # Sem efeito: manda o PNG, igual ao /perfil.
+            arquivo = await gerar_arquivo_cartao(inter.guild, inter.user, conta)
+    except Exception:
+        log.exception("Perfil: tamanho real falhou")
+        await inter.followup.send("⚠️ Não consegui montar o cartão agora.", ephemeral=True)
+        return
+    await inter.followup.send("🔍 Seu cartão em tamanho real (só você está vendo):", file=arquivo, ephemeral=True)
+
+
+class VerTamanhoRealView(discord.ui.View):
+    """Depois do 'Pronto': só o botão de ver em tamanho real."""
+
+    def __init__(self, dono: int) -> None:
+        super().__init__(timeout=900)
+        self.dono = dono
+        botao = discord.ui.Button(label="Ver em tamanho real", emoji="🔍", style=discord.ButtonStyle.primary)
+        botao.callback = ver_tamanho_real
+        self.add_item(botao)
+
+    async def interaction_check(self, inter: discord.Interaction) -> bool:
+        return inter.user.id == self.dono
 
 
 class PainelEstiloView(discord.ui.View):
@@ -7632,9 +7665,11 @@ class PainelEstiloView(discord.ui.View):
         b_campeao.callback = self.abrir_campeao
         b_imagem = discord.ui.Button(label="Enviar imagem ou GIF", emoji="📤", row=4, style=discord.ButtonStyle.secondary)
         b_imagem.callback = self.abrir_imagem
+        b_real = discord.ui.Button(label="Tamanho real", emoji="🔍", row=4, style=discord.ButtonStyle.primary)
+        b_real.callback = ver_tamanho_real
         b_pronto = discord.ui.Button(label="Pronto", emoji="✅", row=4, style=discord.ButtonStyle.success)
         b_pronto.callback = self.fechar
-        for b in (b_campeao, b_imagem, b_pronto):
+        for b in (b_campeao, b_imagem, b_real, b_pronto):
             self.add_item(b)
 
     async def interaction_check(self, inter: discord.Interaction) -> bool:
@@ -7737,12 +7772,12 @@ class PainelEstiloView(discord.ui.View):
     async def fechar(self, inter: discord.Interaction) -> None:
         estilo = estilos_perfil.get(str(self.dono), {})
         atual = inter.message.embeds[0] if inter.message and inter.message.embeds else None
-        texto = _texto_painel(estilo, "✅ Pronto! Use `/perfil` para mostrar seu cartão.", inter.user)
+        texto = _texto_painel(estilo, "✅ Pronto! Use `/perfil` para mostrar seu cartão.", inter.user, menus=False)
         if atual is not None:
             atual.description = texto
-            await inter.response.edit_message(embed=atual, view=None)
+            await inter.response.edit_message(embed=atual, view=VerTamanhoRealView(self.dono))
         else:
-            await inter.response.edit_message(content=texto, view=None)
+            await inter.response.edit_message(content=texto, view=VerTamanhoRealView(self.dono))
         self.stop()
 
 
