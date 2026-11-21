@@ -218,3 +218,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+# Dados salvos pelo bot
+data/
+
+# App do Windows (link do webhook e registro)
+app/config.json
+app/registro.txt
