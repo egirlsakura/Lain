@@ -6966,7 +6966,8 @@ def quadros_do_efeito(efeito: str, tema: dict[str, str], L: int, A: int, n: int,
             yield (None, None)
 
 
-def desenhar_cartao_animado(d: dict[str, Any], efeito: str | None, rapido: bool = False) -> bytes:
+def desenhar_cartao_animado(d: dict[str, Any], efeito: str | None, rapido: bool = False,
+                            caprichado: bool = False) -> bytes:
     """Cartão premium em GIF: fundo (pode ser GIF) + efeito brilhante por cima de tudo."""
     L, A = 1100, altura_do_cartao(d)
     tema = TEMAS_CARTAO.get(d.get("tema") or TEMA_PADRAO, TEMAS_CARTAO[TEMA_PADRAO])
@@ -7004,7 +7005,7 @@ def desenhar_cartao_animado(d: dict[str, Any], efeito: str | None, rapido: bool 
     for qualidade in (92, 82, 72):
         saida = io.BytesIO()
         quadros[0].save(saida, "WEBP", save_all=True, append_images=quadros[1:], duration=duracao, loop=0,
-                        quality=qualidade, method=0)
+                        quality=qualidade, method=5 if caprichado else 0)  # caprichado: mesma qualidade, arquivo menor
         if saida.tell() <= 8_000_000:  # Cabe no limite de envio do Discord.
             return saida.getvalue()
     return saida.getvalue()
@@ -7221,7 +7222,8 @@ def _arquivo_pronto(membro_id: int, chave: str) -> Path:
     return PASTA_CARTOES / str(membro_id) / f"{chave}.bin"
 
 
-async def _cartao_pronto(dados: dict[str, Any], animado: bool, rapido: bool, membro_id: int) -> bytes:
+async def _cartao_pronto(dados: dict[str, Any], animado: bool, rapido: bool, membro_id: int,
+                         caprichado: bool = False) -> bytes:
     """Cartão já feito sai na hora: memória -> arquivo salvo -> só então desenha (e salva)."""
     chave = _chave_cartao(dados, animado, rapido)
     pronto = _cartoes_prontos.pop(chave, None)
@@ -7234,7 +7236,8 @@ async def _cartao_pronto(dados: dict[str, Any], animado: bool, rapido: bool, mem
             pronto = None
     if pronto is None:
         if animado:
-            pronto = await _desenhar(desenhar_cartao_animado, dados, dados.get("efeito"), animado=True)
+            pronto = await _desenhar(desenhar_cartao_animado, dados, dados.get("efeito"), False, caprichado,
+                                     animado=True)
         else:
             pronto = await _desenhar(desenhar_cartao, dados, rapido)
         _salvar_pronto(membro_id, arquivo, pronto)
@@ -7253,6 +7256,137 @@ def _salvar_pronto(membro_id: int, arquivo: Path, conteudo: bytes) -> None:
             velho.unlink(missing_ok=True)
     except OSError as exc:
         log.info("Perfil: não consegui salvar o cartão pronto: %s", exc)
+
+
+# ---- Cartões prontos guardados no próprio Discord (canal oculto) ----
+# Trocar a prévia vira só trocar um link: nada de enviar o arquivo de novo a cada troca.
+ARQUIVO_CDN = Path("/data/cartoes_links.json")
+_cdn: dict[str, Any] = _carregar_json(ARQUIVO_CDN, {"canais": {}, "links": {}})
+
+
+def _salvar_cdn() -> None:
+    links = _cdn.setdefault("links", {})
+    if len(links) > 3000:
+        for velho in sorted(links, key=lambda k: links[k].get("t", 0))[:1000]:
+            links.pop(velho, None)
+    _salvar_json(ARQUIVO_CDN, _cdn)
+
+
+async def canal_dos_cartoes(guild: discord.Guild) -> discord.TextChannel | None:
+    """Canal escolhido pela staff (/perfil_canal_cartoes) onde ficam guardados os cartões prontos."""
+    canal = guild.get_channel(int(_cdn.setdefault("canais", {}).get(str(guild.id), 0) or 0))
+    if isinstance(canal, discord.TextChannel):
+        perms = canal.permissions_for(guild.me)
+        if perms.view_channel and perms.send_messages and perms.attach_files and perms.read_message_history:
+            return canal
+        log.info("Perfil: sem permissão no canal dos cartões (#%s); enviando como arquivo.", canal.name)
+    return None  # Sem canal escolhido: funciona, só que enviando a imagem a cada troca.
+
+
+@bot.tree.command(name="perfil_canal_cartoes",
+                  description="Staff: canal privado onde o bot guarda os cartões prontos (deixa o /perfil_estilo rápido)")
+@app_commands.describe(canal="Um canal privado (que os membros não vejam). Vazio = parar de usar")
+@app_commands.guild_only()
+async def perfil_canal_cartoes(inter: discord.Interaction, canal: Optional[discord.TextChannel] = None) -> None:
+    if not (autorizado(inter) or await pode_gerenciar_contas(inter)):
+        await inter.response.send_message("🔒 Só a staff pode escolher esse canal.", ephemeral=True)
+        return
+    canais = _cdn.setdefault("canais", {})
+    if canal is None:
+        canais.pop(str(inter.guild.id), None)
+        _salvar_cdn()
+        await inter.response.send_message("🗑️ Pronto: o bot não usa mais canal para guardar os cartões.", ephemeral=True)
+        return
+    perms = canal.permissions_for(inter.guild.me)
+    faltando = [nome for nome, ok in (("Ver canal", perms.view_channel), ("Enviar mensagens", perms.send_messages),
+                                      ("Anexar arquivos", perms.attach_files),
+                                      ("Ler histórico de mensagens", perms.read_message_history)) if not ok]
+    if faltando:
+        await inter.response.send_message(f"⚠️ Me dê estas permissões em {canal.mention}: **{', '.join(faltando)}**.",
+                                          ephemeral=True)
+        return
+    canais[str(inter.guild.id)] = canal.id
+    _salvar_cdn()
+    publico = canal.permissions_for(inter.guild.default_role).view_channel
+    await inter.response.send_message(
+        f"✅ Os cartões prontos vão ficar guardados em {canal.mention}. Não apague as mensagens de lá."
+        + ("\n⚠️ Esse canal está **visível para todos**: prefira um canal privado." if publico else ""),
+        ephemeral=True)
+
+
+async def link_do_cartao(guild: discord.Guild, chave: str) -> str | None:
+    """Link do cartão já guardado (renova o link se estiver perto de expirar)."""
+    item = _cdn.setdefault("links", {}).get(chave)
+    if not item:
+        return None
+    if time.time() - item.get("t", 0) < 20 * 3600:
+        return item["u"]
+    canal = guild.get_channel(int(item.get("c", 0)))
+    try:
+        if not isinstance(canal, discord.TextChannel):
+            raise discord.NotFound
+        msg = await canal.fetch_message(int(item["m"]))
+        item.update(u=msg.attachments[0].url, t=time.time())
+        _salvar_cdn()
+        return item["u"]
+    except (discord.HTTPException, IndexError, TypeError):
+        _cdn["links"].pop(chave, None)
+        return None
+
+
+async def guardar_cartao(guild: discord.Guild, chave: str, conteudo: bytes, extensao: str) -> str | None:
+    if chave in _cdn.setdefault("links", {}):
+        return await link_do_cartao(guild, chave)
+    canal = await canal_dos_cartoes(guild)
+    if canal is None:
+        return None
+    try:
+        msg = await canal.send(file=discord.File(io.BytesIO(conteudo), filename=f"cartao.{extensao}"))
+    except discord.HTTPException as exc:
+        log.info("Perfil: não consegui guardar o cartão: %s", exc)
+        return None
+    _cdn["links"][chave] = {"c": canal.id, "m": msg.id, "u": msg.attachments[0].url, "t": time.time()}
+    _salvar_cdn()
+    return msg.attachments[0].url
+
+
+async def imagem_do_painel(guild: discord.Guild, membro: discord.Member,
+                           estatico: bool = False) -> tuple[str | None, discord.File | None]:
+    """(link, None) se o cartão já está guardado no Discord; senão desenha, guarda e devolve o link.
+    Se não der para guardar, devolve (None, arquivo)."""
+    conta = conta_do_cartao(membro.id)
+    if conta is None or Image is None:
+        return None, None
+    try:
+        dados = await dados_do_cartao(guild, membro, conta)
+        animado = not estatico and eh_premium(membro) and bool(dados.get("efeito") or dados.get("fundo_gif"))
+        chave = _chave_cartao(dados, animado, True)
+        link = await link_do_cartao(guild, chave)
+        if link:
+            return link, None
+        pronto = await _cartao_pronto(dados, animado, True, membro.id)
+        extensao = "webp" if animado else "jpg"
+        link = await guardar_cartao(guild, chave, pronto, extensao)
+        if link:
+            return link, None
+        return None, discord.File(io.BytesIO(pronto), filename=f"previa.{extensao}")
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # Qualquer falha no desenho: o painel abre mesmo assim (e o erro vai pro Console).
+        log.exception("Perfil: prévia falhou")
+        return None, None
+
+
+def embed_do_painel(estilo: dict[str, Any], aviso: str, membro: discord.abc.User,
+                    link: str | None, arquivo: discord.File | None) -> discord.Embed:
+    tema = TEMAS_CARTAO.get(estilo.get("tema") or TEMA_PADRAO, TEMAS_CARTAO[TEMA_PADRAO])
+    embed = discord.Embed(description=_texto_painel(estilo, aviso, membro),
+                          color=int(tema["acento"].lstrip("#"), 16))
+    if link:
+        embed.set_image(url=link)
+    elif arquivo is not None:
+        embed.set_image(url=f"attachment://{arquivo.filename}")
+    return embed
 
 
 # ---- Preparação: deixa os 10 efeitos prontos (uma vez) para a troca ser instantânea ----
@@ -7287,11 +7421,12 @@ async def _preparar(guild: discord.Guild, membro: discord.Member) -> None:
         for tema, efeito in combinacoes:
             dados = dict(base, efeito=efeito, tema=tema)
             chave = _chave_cartao(dados, True, True)
-            if chave in _cartoes_prontos or _arquivo_pronto(membro.id, chave).exists():
+            if chave in _cdn.setdefault("links", {}):
                 continue
             async with _fila_preparo:  # Um de cada vez para o bot todo.
-                await _cartao_pronto(dados, True, True, membro.id)
+                pronto = await _cartao_pronto(dados, True, True, membro.id, caprichado=True)
             _cartoes_prontos.pop(chave, None)  # Fica no arquivo; a memória fica livre.
+            await guardar_cartao(guild, chave, pronto, "webp")
     except asyncio.CancelledError:
         pass
     except Exception as exc:  # Preparação é só um extra: nunca derruba nada.
@@ -7515,50 +7650,42 @@ class PainelEstiloView(discord.ui.View):
         return estilo
 
     async def atualizar(self, inter: discord.Interaction, aviso: str = "", campeao: dict[str, Any] | None = None) -> None:
-        """Salva já feito; aqui só redesenha a prévia e o painel."""
+        """Salva já feito; aqui só troca a prévia (um link) e o painel."""
         if not inter.response.is_done():
             await inter.response.defer()
         vez = _vez_do_painel[self.dono] = _vez_do_painel.get(self.dono, 0) + 1
         nova = PainelEstiloView(self.dono, campeao if campeao is not None else self.campeao)
         estilo = estilos_perfil.get(str(self.dono), {})
-        tem_gif = estilo.get("fundo") == "imagem" and (PASTA_FUNDOS / f"{self.dono}.gif").exists()
-        animado = eh_premium(inter.user) and bool(estilo.get("efeito") or tem_gif)
 
         def antiga() -> bool:
             return _vez_do_painel.get(self.dono) != vez  # A pessoa já escolheu outra coisa.
 
-        if animado:
-            tarefa = asyncio.ensure_future(previa_do_estilo(inter.guild, inter.user))
-            feitas, _ = await asyncio.wait({tarefa}, timeout=0.6)
-            if antiga():
-                tarefa.cancel()
-                return
-            if not feitas:
-                # O cartão animado que já está na tela continua rodando enquanto o novo é preparado;
-                # quando fica pronto, troca de uma vez só (sem imagem parada no meio, sem perder qualidade).
-                await inter.edit_original_response(
-                    content=_texto_painel(estilo, "\n".join(t for t in (aviso, "✨ Aplicando...") if t), inter.user),
-                    view=nova)
-                self.stop()
-            nova_imagem = await tarefa
-            if antiga():
-                return
-            try:
-                extra = {"attachments": [nova_imagem]} if nova_imagem else {}
-                await inter.edit_original_response(content=_texto_painel(estilo, aviso, inter.user), view=nova, **extra)
-            except discord.HTTPException as exc:
-                log.warning("Perfil: não consegui trocar a prévia: %s", exc)
-            self.stop()
-            preparar_efeitos(inter.guild, inter.user)
+        tarefa = asyncio.ensure_future(imagem_do_painel(inter.guild, inter.user))
+        feitas, _ = await asyncio.wait({tarefa}, timeout=0.6)
+        if antiga():
+            tarefa.cancel()
             return
-        arquivo = await previa_do_estilo(inter.guild, inter.user, estatico=True)
+        if not feitas:
+            # O cartão que já está na tela continua rodando enquanto o novo é preparado.
+            atual = inter.message.embeds[0] if inter.message and inter.message.embeds else None
+            espera = discord.Embed(description=_texto_painel(estilo, "\n".join(t for t in (aviso, "✨ Aplicando...") if t),
+                                                             inter.user),
+                                   color=atual.color if atual else None)
+            if atual and atual.image and atual.image.url:
+                espera.set_image(url=atual.image.url)
+            await inter.edit_original_response(content=None, embed=espera, view=nova)
+            self.stop()
+        link, arquivo = await tarefa
         if antiga():
             return
-        await inter.edit_original_response(content=_texto_painel(estilo, aviso, inter.user), view=nova,
-                                           attachments=[arquivo] if arquivo else [])
+        extra: dict[str, Any] = {"attachments": [arquivo] if arquivo else []} if (link or arquivo) else {}
+        try:
+            await inter.edit_original_response(content=None, embed=embed_do_painel(estilo, aviso, inter.user, link, arquivo),
+                                               view=nova, **extra)
+        except discord.HTTPException as exc:
+            log.warning("Perfil: não consegui trocar a prévia: %s", exc)
         self.stop()
         preparar_efeitos(inter.guild, inter.user)
-
 
     async def escolher_tema(self, inter: discord.Interaction) -> None:
         await inter.response.defer()  # Responde ao Discord antes de qualquer coisa.
@@ -7609,8 +7736,13 @@ class PainelEstiloView(discord.ui.View):
 
     async def fechar(self, inter: discord.Interaction) -> None:
         estilo = estilos_perfil.get(str(self.dono), {})
-        await inter.response.edit_message(
-            content=_texto_painel(estilo, "✅ Pronto! Use `/perfil` para mostrar seu cartão.", inter.user), view=None)
+        atual = inter.message.embeds[0] if inter.message and inter.message.embeds else None
+        texto = _texto_painel(estilo, "✅ Pronto! Use `/perfil` para mostrar seu cartão.", inter.user)
+        if atual is not None:
+            atual.description = texto
+            await inter.response.edit_message(embed=atual, view=None)
+        else:
+            await inter.response.edit_message(content=texto, view=None)
         self.stop()
 
 
@@ -7679,28 +7811,16 @@ async def perfil_estilo(inter: discord.Interaction) -> None:
         return
     await inter.response.defer(ephemeral=True, thinking=True)
     estilo = estilos_perfil.get(str(inter.user.id), {})
-    tem_gif = estilo.get("fundo") == "imagem" and (PASTA_FUNDOS / f"{inter.user.id}.gif").exists()
-    animado = eh_premium(inter.user) and bool(estilo.get("efeito") or tem_gif)
-    # Abre na hora com a prévia parada (leve); a animada entra assim que fica pronta.
     try:
-        arquivo = await asyncio.wait_for(previa_do_estilo(inter.guild, inter.user, estatico=True), timeout=25)
+        link, arquivo = await asyncio.wait_for(imagem_do_painel(inter.guild, inter.user), timeout=40)
     except asyncio.TimeoutError:
         log.warning("Perfil: prévia demorou demais; abrindo o painel sem imagem.")
-        arquivo = None
-    view = PainelEstiloView(inter.user.id)
-    kwargs: dict[str, Any] = {"content": _texto_painel(estilo, "✨ Gerando a animação..." if animado else "", inter.user),
-                              "view": view, "ephemeral": True}
+        link, arquivo = None, None
+    kwargs: dict[str, Any] = {"embed": embed_do_painel(estilo, "", inter.user, link, arquivo),
+                              "view": PainelEstiloView(inter.user.id), "ephemeral": True}
     if arquivo:
         kwargs["file"] = arquivo
     await inter.followup.send(**kwargs)
-    vez = _vez_do_painel[inter.user.id] = _vez_do_painel.get(inter.user.id, 0) + 1
-    if animado:
-        animada = await previa_do_estilo(inter.guild, inter.user)
-        if animada is not None and _vez_do_painel.get(inter.user.id) == vez:
-            try:
-                await inter.edit_original_response(content=_texto_painel(estilo, "", inter.user), attachments=[animada])
-            except discord.HTTPException as exc:
-                log.warning("Perfil: não consegui trocar pela prévia animada: %s", exc)
     preparar_efeitos(inter.guild, inter.user)
 
 
