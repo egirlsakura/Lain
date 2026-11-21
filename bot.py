@@ -3920,13 +3920,23 @@ TRADUCOES_FILA = (
 )
 
 
+def eh_personalizada(jogo: dict[str, Any]) -> bool:
+    """Personalizadas vêm sem fila (0 ou negativa) ou com gameType de custom."""
+    try:
+        fila = int(jogo.get("gameQueueConfigId") or 0)
+    except (TypeError, ValueError):
+        fila = 0
+    return fila <= 0 or "CUSTOM" in str(jogo.get("gameType") or "").upper()
+
+
 async def nome_fila_lol(jogo: dict[str, Any]) -> str:
     """Nome do modo: lista do bot, depois a lista oficial de filas da Riot."""
     fila_id = int(jogo.get("gameQueueConfigId") or 0)
+    if eh_personalizada(jogo):
+        modo = str(jogo.get("gameMode") or "").upper()
+        return "Personalizada (ARAM)" if modo == "ARAM" else "Personalizada"
     if fila_id in NOMES_FILAS_LOL:
         return NOMES_FILAS_LOL[fila_id]
-    if fila_id == 0 or jogo.get("gameType") == "CUSTOM_GAME":
-        return "Personalizada"
     if not _filas_riot:
         timeout = aiohttp.ClientTimeout(total=8, connect=4)
         try:
@@ -4577,7 +4587,56 @@ async def on_connect() -> None:
 # para a call de origem e apaga os canais (igual ao /partida_finalizar).
 # /partida_finalizar e /partida_cancelar continuam funcionando normalmente.
 AUTO_MINIMO_VINCULADOS = 2         # Membros vinculados da partida que precisam estar no jogo.
-AUTO_DESISTIR_APOS = 4 * 3600      # Sem resultado depois disso, avisa para finalizar na mão.
+
+
+def _texto_final(guild: discord.Guild, mensagem: str, varias: bool) -> str:
+    """Com uma partida só, tira a linha '🎮 Partida N' e começa pelo vencedor."""
+    if not varias:
+        primeira, _sep, resto = mensagem.partition("\n")
+        if primeira.startswith("🎮") and resto:
+            return resto
+    return mensagem
+
+
+class BotoesVencedorView(discord.ui.View):
+    """Botões de vencedor quando a Riot não informa o resultado da personalizada."""
+
+    def __init__(self, chave: str, partida: dict[str, Any]) -> None:
+        super().__init__(timeout=None)
+        self.chave = chave
+        times = list((partida.get("canais") or {}).keys()) or ["vermelho", "azul"]
+        for time_chave in times:
+            emoji, nome = next(((e, n) for c, e, n in EQUIPES if c == time_chave), ("🏆", time_chave))
+            botao = discord.ui.Button(label=f"{nome} venceu", emoji=emoji, style=discord.ButtonStyle.secondary)
+            botao.callback = self._criar_callback(time_chave)
+            self.add_item(botao)
+
+    def _criar_callback(self, vencedor: str):
+        async def callback(inter: discord.Interaction) -> None:
+            guild = inter.guild
+            if guild is None or not (autorizado(inter) or await pode_gerenciar_contas(inter)):
+                await inter.response.send_message(
+                    "⛔ Apenas membros com **Gerenciar Canais** podem registrar o vencedor.", ephemeral=True
+                )
+                return
+            await inter.response.defer()
+            async with trava_servidor(guild.id):
+                if self.chave not in partidas:
+                    await inter.followup.send("ℹ️ Essa partida já foi finalizada.", ephemeral=True)
+                    try:
+                        await inter.message.edit(view=None)
+                    except (discord.HTTPException, AttributeError):
+                        pass
+                    return
+                varias = len(partidas_do_servidor(guild.id)) > 1
+                mensagem = await encerrar_partida(guild, self.chave, vencedor)
+            try:
+                await inter.message.edit(content=_texto_final(guild, mensagem, varias), view=None,
+                                         allowed_mentions=discord.AllowedMentions.none())
+            except (discord.HTTPException, AttributeError):
+                await inter.followup.send(_texto_final(guild, mensagem, varias),
+                                          allowed_mentions=discord.AllowedMentions.none())
+        return callback
 
 
 def _puuids_da_partida(partida: dict[str, Any]) -> dict[str, tuple[int, str]]:
@@ -4612,12 +4671,18 @@ async def _ligar_partida_lol(guild: discord.Guild, chave: str, partida: dict[str
         jogo = await partida_ativa(puuid)
         if not jogo:
             continue
-        personalizada = int(jogo.get("gameQueueConfigId") or 0) == 0 or jogo.get("gameType") == "CUSTOM_GAME"
+        personalizada = eh_personalizada(jogo)
+        log.info(
+            "Auto vencedor: partida encontrada fila=%s tipo=%s modo=%s",
+            jogo.get("gameQueueConfigId"), jogo.get("gameType"), jogo.get("gameMode"),
+        )
         presentes = [p for p in jogo.get("participants", []) if p.get("puuid") in vinculados]
         if not personalizada or len(presentes) < minimo:
             return
         partida["lol_game_id"] = int(jogo["gameId"])
         partida["lol_desde"] = time.time()
+        partida["lol_puuids"] = [p["puuid"] for p in presentes][:3]
+        partida.pop("lol_terminou_em", None)
         salvar_partidas()
         canal = _canal_de_aviso(guild, partida)
         if canal:
@@ -4632,27 +4697,49 @@ async def _ligar_partida_lol(guild: discord.Guild, chave: str, partida: dict[str
         return
 
 
+AUTO_ESPERA_RESULTADO = 10 * 60   # Depois do fim, tempo esperando a Riot publicar o resultado.
+
+
+async def _pedir_vencedor_com_botoes(guild: discord.Guild, chave: str, partida: dict[str, Any]) -> None:
+    """A Riot não liberou o resultado: pergunta com botões (igual ao /partida_finalizar)."""
+    partida.pop("lol_game_id", None)
+    partida["lol_desistiu"] = True
+    salvar_partidas()
+    canal = _canal_de_aviso(guild, partida)
+    if canal is None:
+        return
+    titulo = f"🎮 **Partida {partida.get('numero', 1)}**\n" if len(partidas_do_servidor(guild.id)) > 1 else ""
+    await canal.send(
+        titulo + "🏁 **A partida acabou! Quem venceu?**",
+        view=BotoesVencedorView(chave, partida),
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
 async def _conferir_resultado(guild: discord.Guild, chave: str, partida: dict[str, Any]) -> None:
     """Se a partida do LoL terminou, registra o vencedor e finaliza a partida interna."""
+    # 1) Ainda está em jogo? (mesma consulta do /aovivo)
+    if not partida.get("lol_terminou_em"):
+        for puuid in partida.get("lol_puuids") or list(_puuids_da_partida(partida))[:3]:
+            jogo = await partida_ativa(puuid)
+            if jogo and int(jogo.get("gameId") or 0) == int(partida["lol_game_id"]):
+                return  # Ainda jogando.
+        partida["lol_terminou_em"] = time.time()
+        salvar_partidas()
+
+    # 2) Acabou: tenta o resultado oficial.
     match_id = f"{RIOT_PLATAFORMA.upper()}_{partida['lol_game_id']}"
     try:
         dados = await chamar_riot(
             f"https://{RIOT_REGIAO}.api.riotgames.com/lol/match/v5/matches/{quote(match_id, safe='')}"
         )
     except ErroRiot as exc:
-        if exc.status != 404:
+        if exc.status not in (403, 404):
             raise
-        # 404: a partida ainda está em andamento (ou a Riot ainda não publicou).
-        if time.time() - float(partida.get("lol_desde") or time.time()) > AUTO_DESISTIR_APOS:
-            partida.pop("lol_game_id", None)
-            partida["lol_desistiu"] = True
-            salvar_partidas()
-            canal = _canal_de_aviso(guild, partida)
-            if canal:
-                await canal.send(
-                    f"⚠️ Não encontrei o resultado da **Partida {partida.get('numero', 1)}** na Riot. "
-                    "Finalize com `/partida_finalizar`.",
-                )
+        # A Riot ainda não publicou (ou não publica personalizadas).
+        if time.time() - float(partida["lol_terminou_em"]) > AUTO_ESPERA_RESULTADO:
+            log.info("Auto vencedor: a Riot não liberou %s; pedindo o vencedor com botões.", match_id)
+            await _pedir_vencedor_com_botoes(guild, chave, partida)
         return
 
     info = dados.get("info", {}) if isinstance(dados, dict) else {}
@@ -4662,6 +4749,7 @@ async def _conferir_resultado(guild: discord.Guild, chave: str, partida: dict[st
     if int(info.get("gameDuration") or 0) < 300:
         # Remake: desfaz a ligação para detectar a próxima personalizada.
         partida.pop("lol_game_id", None)
+        partida.pop("lol_terminou_em", None)
         salvar_partidas()
         if canal:
             await canal.send(
@@ -4677,25 +4765,11 @@ async def _conferir_resultado(guild: discord.Guild, chave: str, partida: dict[st
             time_bot = vinculados[p["puuid"]][1]
             votos[time_bot] = votos.get(time_bot, 0) + 1
     if not votos:
-        partida.pop("lol_game_id", None)
-        partida["lol_desistiu"] = True
-        salvar_partidas()
-        if canal:
-            await canal.send(
-                f"⚠️ A personalizada da **Partida {partida.get('numero', 1)}** acabou, mas nenhum "
-                "jogador vinculado estava no time vencedor. Finalize com `/partida_finalizar`."
-            )
+        await _pedir_vencedor_com_botoes(guild, chave, partida)
         return
     ordenados = sorted(votos.items(), key=lambda item: -item[1])
     if len(ordenados) > 1 and ordenados[0][1] == ordenados[1][1]:
-        partida.pop("lol_game_id", None)
-        partida["lol_desistiu"] = True
-        salvar_partidas()
-        if canal:
-            await canal.send(
-                f"⚠️ Os times do LoL não batem com o sorteio da **Partida {partida.get('numero', 1)}**. "
-                "Finalize com `/partida_finalizar`."
-            )
+        await _pedir_vencedor_com_botoes(guild, chave, partida)
         return
     vencedor = ordenados[0][0]
 
@@ -4703,12 +4777,7 @@ async def _conferir_resultado(guild: discord.Guild, chave: str, partida: dict[st
         if chave not in partidas:  # Alguém finalizou na mão enquanto isso.
             return
         varias = len(partidas_do_servidor(guild.id)) > 1
-        mensagem = await encerrar_partida(guild, chave, vencedor)
-    if not varias:
-        # Com uma partida só, o número não é necessário: começa direto pelo vencedor.
-        primeira, _sep, resto = mensagem.partition("\n")
-        if primeira.startswith("🎮") and resto:
-            mensagem = resto
+        mensagem = _texto_final(guild, await encerrar_partida(guild, chave, vencedor), varias)
     if canal:
         await canal.send(mensagem, allowed_mentions=discord.AllowedMentions.none())
 
@@ -4932,7 +5001,8 @@ async def teste(inter: discord.Interaction, amigo: discord.Member | None = None)
         + (" com o seu amigo no time adversário." if len(jogadores) > 1 else " (pode ser contra bots)."),
         "2. Quando abrir a tela de carregamento, em até 30 s eu aviso aqui que liguei a partida.",
         "3. Jogue **mais de 5 minutos** (antes disso a Riot conta como remake) e termine a partida.",
-        "4. Em alguns minutos após o fim, eu anuncio o vencedor aqui e devolvo todos para a call.",
+        "4. Quando acabar, eu anuncio o vencedor aqui e devolvo todos para a call. "
+        "Se a Riot não liberar o resultado em 10 min, mando botões para escolher o vencedor.",
         "",
         "Para desistir do teste: `/partida_cancelar`.",
     ]
