@@ -6736,7 +6736,7 @@ def altura_do_cartao(d: dict[str, Any]) -> int:
     return 560 if d.get("outras") else 500
 
 
-def desenhar_cartao(d: dict[str, Any]) -> bytes:
+def desenhar_cartao(d: dict[str, Any], rapido: bool = False) -> bytes:
     """Cartão estático (PNG)."""
     L, A = 1100, altura_do_cartao(d)
     tema = TEMAS_CARTAO.get(d.get("tema") or TEMA_PADRAO, TEMAS_CARTAO[TEMA_PADRAO])
@@ -6745,7 +6745,10 @@ def desenhar_cartao(d: dict[str, Any]) -> bytes:
     imagem.alpha_composite(camada_enfeites(tema, so_cores, sum(map(ord, d.get("nome", ""))), L, A))
     imagem.alpha_composite(camada_conteudo(d, tema, L, A))
     saida = io.BytesIO()
-    imagem.convert("RGB").save(saida, "PNG", optimize=True)
+    if rapido:  # Prévia do painel: JPEG é bem mais leve para enviar (≈10x menor).
+        imagem.convert("RGB").save(saida, "JPEG", quality=88)
+    else:
+        imagem.convert("RGB").save(saida, "PNG", optimize=True)
     return saida.getvalue()
 
 
@@ -6961,14 +6964,14 @@ def quadros_do_efeito(efeito: str, tema: dict[str, str], L: int, A: int, n: int,
     return saida
 
 
-def desenhar_cartao_animado(d: dict[str, Any], efeito: str | None) -> bytes:
+def desenhar_cartao_animado(d: dict[str, Any], efeito: str | None, rapido: bool = False) -> bytes:
     """Cartão premium em GIF: fundo (pode ser GIF) + efeito brilhante por cima de tudo."""
     L, A = 1100, altura_do_cartao(d)
     tema = TEMAS_CARTAO.get(d.get("tema") or TEMA_PADRAO, TEMAS_CARTAO[TEMA_PADRAO])
     fundos, duracao, so_cores = fundos_do_cartao(d, tema, L, A, animado=True)
     k = len(fundos)
     n = k * max(1, -(-20 // k)) if k > 1 else 20
-    n = min(n, 30)
+    n = min(n, 16 if rapido else 30)
     if k == 1:
         duracao = 75
     semente = sum(map(ord, d.get("nome", "")))
@@ -6993,14 +6996,15 @@ def desenhar_cartao_animado(d: dict[str, Any], efeito: str | None) -> bytes:
             q.alpha_composite(frente)
         quadros.append(q.convert("RGB"))
 
-    for escala, cores in ((0.8, 200), (0.7, 160), (0.6, 128)):
+    tentativas = ((0.55, 128), (0.45, 96)) if rapido else ((0.8, 200), (0.7, 160), (0.6, 128))
+    for escala, cores in tentativas:
         tamanho = (int(L * escala), int(A * escala))
         prontos = [q.resize(tamanho, Image.LANCZOS).quantize(colors=cores, method=Image.Quantize.FASTOCTREE,
                                                               dither=Image.Dither.FLOYDSTEINBERG) for q in quadros]
         saida = io.BytesIO()
         prontos[0].save(saida, "GIF", save_all=True, append_images=prontos[1:], duration=duracao, loop=0,
                         disposal=1, optimize=False)
-        if saida.tell() <= 7_500_000:  # Cabe no limite de envio do Discord.
+        if saida.tell() <= (2_500_000 if rapido else 7_500_000):  # Cabe no limite de envio do Discord.
             return saida.getvalue()
     return saida.getvalue()
 
@@ -7194,15 +7198,15 @@ def conta_do_cartao(membro_id: int, conta: str | None = None) -> dict[str, Any] 
 
 
 async def gerar_arquivo_cartao(guild: discord.Guild, membro: discord.Member, conta: dict[str, Any],
-                               nome: str = "perfil", estatico: bool = False) -> discord.File:
-    """PNG normal ou GIF animado (premium com efeito ou fundo em GIF)."""
+                               nome: str = "perfil", estatico: bool = False, rapido: bool = False) -> discord.File:
+    """PNG normal ou GIF animado (premium com efeito ou fundo em GIF). rapido = prévia leve do painel."""
     dados = await dados_do_cartao(guild, membro, conta)
     animado = not estatico and eh_premium(membro) and bool(dados.get("efeito") or dados.get("fundo_gif"))
     if animado:
-        gif = await _desenhar(desenhar_cartao_animado, dados, dados.get("efeito"))
+        gif = await _desenhar(desenhar_cartao_animado, dados, dados.get("efeito"), rapido, animado=True)
         return discord.File(io.BytesIO(gif), filename=f"{nome}.gif")
-    png = await _desenhar(desenhar_cartao, dados)
-    return discord.File(io.BytesIO(png), filename=f"{nome}.png")
+    imagem = await _desenhar(desenhar_cartao, dados, rapido)
+    return discord.File(io.BytesIO(imagem), filename=f"{nome}.{'jpg' if rapido else 'png'}")
 
 
 @bot.tree.command(name="perfil", description="Cartão de jogador com elo, campeão principal, personalizadas e medalhas")
@@ -7315,7 +7319,7 @@ async def previa_do_estilo(guild: discord.Guild, membro: discord.Member, estatic
     if conta is None or Image is None:
         return None
     try:
-        return await gerar_arquivo_cartao(guild, membro, conta, nome="previa", estatico=estatico)
+        return await gerar_arquivo_cartao(guild, membro, conta, nome="previa", estatico=estatico, rapido=True)
     except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, KeyError, ErroRiot, OSError) as exc:
         log.warning("Perfil: prévia falhou: %s", exc)
         return None
@@ -7434,6 +7438,9 @@ class PainelEstiloView(discord.ui.View):
         if not animado:
             return
         # 2º passo: a versão animada substitui a parada quando fica pronta.
+        await asyncio.sleep(0.6)  # Se a pessoa já trocou de novo, nem começa esta animação.
+        if _vez_do_painel.get(self.dono) != vez:
+            return
         gif = await previa_do_estilo(inter.guild, inter.user)
         if gif is None or _vez_do_painel.get(self.dono) != vez:
             return
@@ -7628,28 +7635,31 @@ def iniciar_recursos_extras() -> None:
 import concurrent.futures as _futuros
 import multiprocessing as _multiproc
 
-_desenhista: "_futuros.ProcessPoolExecutor | None" = None
+_desenhistas: dict[str, "_futuros.ProcessPoolExecutor | None"] = {"parado": None, "animado": None}
 
 
 def _preparar_desenhista() -> None:
-    """Cria 1 processo ajudante só para desenhar (criado aqui, antes do bot ligar)."""
-    global _desenhista
-    try:
-        _desenhista = _futuros.ProcessPoolExecutor(max_workers=1, mp_context=_multiproc.get_context("fork"))
-        _desenhista.submit(int).result(timeout=30)
-    except Exception as exc:  # Sem fork (ex.: Windows): desenha no próprio bot, como antes.
-        log.warning("Cartão: sem processo ajudante (%s); desenhando no próprio bot.", exc)
-        _desenhista = None
-
-
-async def _desenhar(funcao: Any, *args: Any) -> Any:
-    global _desenhista
-    if _desenhista is not None:
+    """2 processos ajudantes (criados aqui, antes do bot ligar): um para a prévia parada e
+    outro para os GIFs. Assim a troca de cor/tema não espera uma animação terminar."""
+    for tipo in _desenhistas:
         try:
-            return await asyncio.get_running_loop().run_in_executor(_desenhista, funcao, *args)
+            ajudante = _futuros.ProcessPoolExecutor(max_workers=1, mp_context=_multiproc.get_context("fork"))
+            ajudante.submit(int).result(timeout=30)
+            _desenhistas[tipo] = ajudante
+        except Exception as exc:  # Sem fork (ex.: Windows): desenha no próprio bot, como antes.
+            log.warning("Cartão: sem processo ajudante (%s); desenhando no próprio bot.", exc)
+            _desenhistas[tipo] = None
+
+
+async def _desenhar(funcao: Any, *args: Any, animado: bool = False) -> Any:
+    tipo = "animado" if animado else "parado"
+    ajudante = _desenhistas.get(tipo)
+    if ajudante is not None:
+        try:
+            return await asyncio.get_running_loop().run_in_executor(ajudante, funcao, *args)
         except _futuros.process.BrokenProcessPool as exc:
             log.warning("Cartão: processo ajudante caiu (%s); desenhando no próprio bot.", exc)
-            _desenhista = None
+            _desenhistas[tipo] = None
     return await asyncio.to_thread(funcao, *args)
 
 
