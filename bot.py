@@ -6748,7 +6748,7 @@ def desenhar_cartao(d: dict[str, Any], rapido: bool = False) -> bytes:
     imagem.alpha_composite(camada_conteudo(d, tema, L, A))
     saida = io.BytesIO()
     if rapido:  # Prévia do painel: JPEG é bem mais leve para enviar (≈10x menor).
-        imagem.convert("RGB").save(saida, "JPEG", quality=88)
+        imagem.convert("RGB").save(saida, "JPEG", quality=92, subsampling=0)
     else:
         imagem.convert("RGB").save(saida, "PNG", optimize=True)
     return saida.getvalue()
@@ -6973,7 +6973,7 @@ def desenhar_cartao_animado(d: dict[str, Any], efeito: str | None, rapido: bool 
     fundos, duracao, so_cores = fundos_do_cartao(d, tema, L, A, animado=True)
     k = len(fundos)
     n = k * max(1, -(-20 // k)) if k > 1 else 20
-    n = min(n, 16 if rapido else 24)
+    n = min(n, 24)
     if k == 1:
         duracao = 75
     semente = sum(map(ord, d.get("nome", "")))
@@ -6998,15 +6998,13 @@ def desenhar_cartao_animado(d: dict[str, Any], efeito: str | None, rapido: bool 
             q.alpha_composite(frente)
         quadros.append(q.convert("RGB"))
 
-    tentativas = ((0.55, 128), (0.45, 96)) if rapido else ((0.7, 192), (0.6, 160), (0.5, 128))
-    for escala, cores in tentativas:
-        tamanho = (int(L * escala), int(A * escala))
-        prontos = [q.resize(tamanho, Image.LANCZOS).quantize(colors=cores, method=Image.Quantize.FASTOCTREE,
-                                                              dither=Image.Dither.FLOYDSTEINBERG) for q in quadros]
+    # WebP animado: tamanho real, milhões de cores e bordas lisas (o GIF só tem 256 cores e
+    # deixava o cartão "granulado"). O Discord mostra WebP animado em todas as plataformas.
+    for qualidade in (88, 76, 66):
         saida = io.BytesIO()
-        prontos[0].save(saida, "GIF", save_all=True, append_images=prontos[1:], duration=duracao, loop=0,
-                        disposal=1, optimize=False)
-        if saida.tell() <= (2_500_000 if rapido else 5_000_000):  # Cabe no limite de envio do Discord.
+        quadros[0].save(saida, "WEBP", save_all=True, append_images=quadros[1:], duration=duracao, loop=0,
+                        quality=qualidade, method=2)
+        if saida.tell() <= 8_000_000:  # Cabe no limite de envio do Discord.
             return saida.getvalue()
     return saida.getvalue()
 
@@ -7207,21 +7205,66 @@ async def gerar_arquivo_cartao(guild: discord.Guild, membro: discord.Member, con
     """PNG normal ou GIF animado (premium com efeito ou fundo em GIF). rapido = prévia leve do painel."""
     dados = await dados_do_cartao(guild, membro, conta)
     animado = not estatico and eh_premium(membro) and bool(dados.get("efeito") or dados.get("fundo_gif"))
-    extensao = "gif" if animado else ("jpg" if rapido else "png")
-    # Cartão igual ao último desenhado (ex.: voltar para um efeito já visto) sai na hora.
-    chave = hashlib.sha1(pickle.dumps((dados, animado, rapido))).hexdigest()
-    pronto = _cartoes_prontos.get(chave)
+    extensao = "webp" if animado else ("jpg" if rapido else "png")
+    pronto = await _cartao_pronto(dados, animado, rapido)
+    return discord.File(io.BytesIO(pronto), filename=f"{nome}.{extensao}")
+
+
+def _chave_cartao(dados: dict[str, Any], animado: bool, rapido: bool) -> str:
+    return hashlib.sha1(pickle.dumps((dados, animado, rapido and not animado))).hexdigest()
+
+
+async def _cartao_pronto(dados: dict[str, Any], animado: bool, rapido: bool) -> bytes:
+    """Cartão já desenhado (ex.: um efeito pré-desenhado ou já visto) sai na hora."""
+    chave = _chave_cartao(dados, animado, rapido)
+    pronto = _cartoes_prontos.pop(chave, None)
     if pronto is None:
         if animado:
-            pronto = await _desenhar(desenhar_cartao_animado, dados, dados.get("efeito"), rapido, animado=True)
+            pronto = await _desenhar(desenhar_cartao_animado, dados, dados.get("efeito"), animado=True)
         else:
             pronto = await _desenhar(desenhar_cartao, dados, rapido)
-        _cartoes_prontos[chave] = pronto
-        while len(_cartoes_prontos) > 16:
-            _cartoes_prontos.pop(next(iter(_cartoes_prontos)))
-    else:
-        _cartoes_prontos[chave] = _cartoes_prontos.pop(chave)
-    return discord.File(io.BytesIO(pronto), filename=f"{nome}.{extensao}")
+    _cartoes_prontos[chave] = pronto
+    while len(_cartoes_prontos) > 48:
+        _cartoes_prontos.pop(next(iter(_cartoes_prontos)))
+    return pronto
+
+
+_antecipando: dict[int, "asyncio.Task[None]"] = {}
+_trava_antecipacao = asyncio.Lock()
+
+
+def antecipar_efeitos(guild: discord.Guild, membro: discord.Member) -> None:
+    """Em segundo plano, já desenha o cartão com cada efeito: trocar no painel fica instantâneo."""
+    if not eh_premium(membro) or Image is None:
+        return
+    anterior = _antecipando.pop(membro.id, None)
+    if anterior is not None:
+        anterior.cancel()
+    _antecipando[membro.id] = asyncio.ensure_future(_antecipar(guild, membro))
+
+
+async def _antecipar(guild: discord.Guild, membro: discord.Member) -> None:
+    try:
+        await asyncio.sleep(1.5)  # Deixa a troca atual terminar primeiro.
+        conta = conta_do_cartao(membro.id)
+        if conta is None:
+            return
+        base = await dados_do_cartao(guild, membro, conta)
+        atual = base.get("efeito")
+        ordem = [e for e in EFEITOS_PREMIUM if e != atual]
+        for efeito in ordem:
+            dados = dict(base, efeito=efeito)
+            if _chave_cartao(dados, True, True) in _cartoes_prontos:
+                continue
+            async with _trava_antecipacao:  # Um de cada vez, para não atrasar quem está usando o bot.
+                await _cartao_pronto(dados, True, True)
+    except asyncio.CancelledError:
+        pass
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, KeyError, ErroRiot, OSError) as exc:
+        log.info("Perfil: não consegui pré-desenhar os efeitos: %s", exc)
+    finally:
+        if _antecipando.get(membro.id) is asyncio.current_task():
+            _antecipando.pop(membro.id, None)
 
 
 @bot.tree.command(name="perfil", description="Cartão de jogador com elo, campeão principal, personalizadas e medalhas")
@@ -7455,6 +7498,8 @@ class PainelEstiloView(discord.ui.View):
                 await inter.edit_original_response(content=_texto_painel(estilo, aviso, inter.user), view=nova,
                                                    attachments=[tarefa_gif.result()])
                 self.stop()
+                if isinstance(inter.user, discord.Member):
+                    antecipar_efeitos(inter.guild, inter.user)
                 return
         # Prévia parada (rápida) enquanto a animação termina.
         arquivo = await previa_do_estilo(inter.guild, inter.user, estatico=True)
@@ -7469,6 +7514,8 @@ class PainelEstiloView(discord.ui.View):
         )
         self.stop()
         if tarefa_gif is None:
+            if isinstance(inter.user, discord.Member):
+                antecipar_efeitos(inter.guild, inter.user)
             return
         gif = await tarefa_gif
         if gif is None or antiga():
@@ -7477,6 +7524,8 @@ class PainelEstiloView(discord.ui.View):
             await inter.edit_original_response(content=_texto_painel(estilo, aviso, inter.user), attachments=[gif])
         except discord.HTTPException as exc:
             log.warning("Perfil: não consegui trocar pela prévia animada: %s", exc)
+        if isinstance(inter.user, discord.Member):
+            antecipar_efeitos(inter.guild, inter.user)
 
     async def escolher_tema(self, inter: discord.Interaction) -> None:
         self._salvar(tema=inter.data["values"][0])
@@ -7599,6 +7648,8 @@ async def perfil_estilo(inter: discord.Interaction) -> None:
     if arquivo:
         kwargs["file"] = arquivo
     await inter.followup.send(**kwargs)
+    if isinstance(inter.user, discord.Member):
+        antecipar_efeitos(inter.guild, inter.user)
 
 
 @bot.tree.command(name="perfil_fundo_remover", description="Staff: remove a imagem de fundo do cartão de um membro")
