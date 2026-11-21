@@ -5770,21 +5770,75 @@ async def _icones_ou_nomes(ids: list[int]) -> list[str]:
     return [icones.get(i) or f"**{nomes.get(i, i)}**" for i in ids]
 
 
-async def montar_rotacao() -> discord.Embed:
+async def _ids_de_campeoes(valor: Any) -> list[int]:
+    """Aceita lista de IDs (números ou texto), nomes/chaves de campeão ou objetos com o ID."""
+    if not isinstance(valor, list):
+        return []
+    nomes = await nomes_campeoes()
+    por_nome = {_normalizar_nome(n): i for i, n in nomes.items()}
+    try:
+        versao = (await versoes_ddragon())[0]
+        for c in (await campeoes_completos(versao)).get("data", {}).values():
+            por_nome[_normalizar_nome(c.get("id", ""))] = int(c["key"])
+            por_nome[_normalizar_nome(c.get("name", ""))] = int(c["key"])
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, KeyError):
+        pass
+    ids = []
+    for item in valor:
+        if isinstance(item, dict):
+            item = item.get("championId", item.get("id", item.get("key", item.get("name"))))
+        if isinstance(item, bool):
+            continue
+        if isinstance(item, int):
+            ids.append(item)
+        elif isinstance(item, str) and item.strip().isdigit():
+            ids.append(int(item.strip()))
+        elif isinstance(item, str) and _normalizar_nome(item) in por_nome:
+            ids.append(por_nome[_normalizar_nome(item)])
+    return list(dict.fromkeys(ids))
+
+
+def _normalizar_nome(texto: str) -> str:
+    import unicodedata
+    texto = unicodedata.normalize("NFKD", str(texto)).encode("ascii", "ignore").decode()
+    return "".join(ch for ch in texto.lower() if ch.isalnum())
+
+
+async def ler_rotacao() -> tuple[list[int], list[int], int]:
+    """A Riot mudou o formato desta resposta em 2026 ('sr'/'newplayer' no lugar dos nomes antigos)."""
     dados = await chamar_riot(
         f"https://{RIOT_PLATAFORMA}.api.riotgames.com/lol/platform/v3/champion-rotations"
     )
-    nomes = await nomes_campeoes()
-    gratis = sorted(dados.get("freeChampionIds", []), key=lambda i: nomes.get(i, ""))
-    novatos = sorted(dados.get("freeChampionIdsForNewPlayers", []), key=lambda i: nomes.get(i, ""))
+    if not isinstance(dados, dict):
+        dados = {}
+    gratis = await _ids_de_campeoes(dados.get("freeChampionIds") or dados.get("sr"))
+    novatos = await _ids_de_campeoes(dados.get("freeChampionIdsForNewPlayers") or dados.get("newplayer")
+                                     or dados.get("newPlayer"))
     if not gratis and not novatos:
-        log.warning("Rotação: a Riot respondeu sem campeões: %s", dados)
+        # Formato desconhecido: tenta qualquer lista que tenha campeões.
+        for chave, valor in dados.items():
+            ids = await _ids_de_campeoes(valor)
+            if ids:
+                log.info("Rotação: usando o campo '%s' da resposta da Riot.", chave)
+                gratis = ids
+                break
+    if not gratis and not novatos:
+        log.warning("Rotação: a Riot respondeu sem campeões: %s", str(dados)[:500])
+    nivel = dados.get("maxNewPlayerLevel") or dados.get("newPlayerMaxLevel") or 10
+    return gratis, novatos, int(nivel) if str(nivel).isdigit() else 10
+
+
+async def montar_rotacao() -> discord.Embed:
+    nomes = await nomes_campeoes()
+    ids_gratis, ids_novatos, nivel = await ler_rotacao()
+    gratis = sorted(ids_gratis, key=lambda i: nomes.get(i, ""))
+    novatos = sorted(ids_novatos, key=lambda i: nomes.get(i, ""))
     embed = discord.Embed(title="🔄 Rotação grátis da semana", color=0x0AC8B9,
                           description=" ".join(await _icones_ou_nomes(gratis))[:4000]
-                          or "⚠️ A Riot não informou a rotação desta semana. Tente de novo mais tarde.")
+                          or "⚠️ A API oficial da Riot não está informando a rotação desta semana.")
     if novatos:
         embed.add_field(
-            name=f"🌱 Para novos jogadores (até o nível {dados.get('maxNewPlayerLevel', 10)})",
+            name=f"🌱 Para novos jogadores (até o nível {nivel})",
             value=" ".join(await _icones_ou_nomes(novatos))[:1024], inline=False,
         )
     embed.set_footer(text="Dados oficiais da Riot Games")
@@ -5804,10 +5858,8 @@ async def checar_rotacao_nova() -> None:
     servidores = [g for g in bot.guilds if destino_aviso(g, "rotacao")]
     if not servidores:
         return
-    dados = await chamar_riot(
-        f"https://{RIOT_PLATAFORMA}.api.riotgames.com/lol/platform/v3/champion-rotations"
-    )
-    atual = sorted(dados.get("freeChampionIds", []))
+    gratis, _novatos, _nivel = await ler_rotacao()
+    atual = sorted(gratis)
     if not atual:
         return  # Riot sem dados: não manda aviso vazio.
     estado = avisos.setdefault("_estado", {})
@@ -6953,12 +7005,37 @@ def desenhar_cartao_animado(d: dict[str, Any], efeito: str | None) -> bytes:
     return saida.getvalue()
 
 
+_guardados_cartao: dict[str, tuple[float, Any]] = {}
+
+
+async def _guardado(chave: str, fabrica: Any, validade: float) -> Any:
+    """Guarda o resultado por um tempo: trocar tema/cor no painel não busca tudo de novo."""
+    agora = time.monotonic()
+    item = _guardados_cartao.get(chave)
+    if item and agora - item[0] < validade:
+        return item[1]
+    valor = await fabrica()
+    _guardados_cartao[chave] = (agora, valor)
+    if len(_guardados_cartao) > 150:
+        for velho in sorted(_guardados_cartao, key=lambda k: _guardados_cartao[k][0])[:50]:
+            _guardados_cartao.pop(velho, None)
+    return valor
+
+
+async def _imagem_guardada(url: str) -> bytes | None:
+    try:
+        return await _guardado(f"img:{url}", lambda: _baixar(url, binario=True), 6 * 3600)
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+        return None
+
+
 async def dados_do_cartao(guild: discord.Guild, membro: discord.Member, conta: dict[str, Any]) -> dict[str, Any]:
     puuid = conta["puuid"]
     versao = (await versoes_ddragon())[0]
     base = f"https://ddragon.leagueoflegends.com/cdn/{versao}/img"
+    url_invocador = f"https://{RIOT_PLATAFORMA}.api.riotgames.com/lol/summoner/v4/summoners/by-puuid/{quote(puuid, safe='')}"
     invocador, ranques, maestrias = await asyncio.gather(
-        chamar_riot(f"https://{RIOT_PLATAFORMA}.api.riotgames.com/lol/summoner/v4/summoners/by-puuid/{quote(puuid, safe='')}"),
+        _guardado(f"inv:{puuid}", lambda: chamar_riot(url_invocador), 300),
         ranques_conta(puuid), maestrias_conta(puuid), return_exceptions=True,
     )
     invocador = invocador if isinstance(invocador, dict) else {}
@@ -6995,24 +7072,18 @@ async def dados_do_cartao(guild: discord.Guild, membro: discord.Member, conta: d
         "splash": None if fundo_tipo in ("imagem", "cores") else splash,
         "main_icone": f"{base}/champion/{main['image']['full']}" if main else None,
     }
-    imagens = {}
-    for chave, url in downloads.items():
-        if url:
-            try:
-                imagens[chave] = await _baixar(url, binario=True)
-            except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
-                imagens[chave] = None
+    chaves = [k for k, u in downloads.items() if u]
+    baixadas = await asyncio.gather(*[_imagem_guardada(downloads[k]) for k in chaves])
+    imagens = dict(zip(chaves, baixadas))
     est = estatisticas_internas(guild.id, membro.id)
     pontos_main = int(principal.get("championPoints", 0)) if principal else 0
 
     # Outras contas do membro (até 4): Riot ID + melhor elo.
     outras = []
-    for extra in contas_do_usuario(membro.id):
-        if extra.get("puuid") == puuid:
-            continue
-        try:
-            entradas = await ranques_conta(extra["puuid"])
-        except (ErroRiot, aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+    extras_contas = [c for c in contas_do_usuario(membro.id) if c.get("puuid") != puuid][:4]
+    todas_entradas = await asyncio.gather(*[ranques_conta(c["puuid"]) for c in extras_contas], return_exceptions=True)
+    for extra, entradas in zip(extras_contas, todas_entradas):
+        if not isinstance(entradas, list):
             entradas = []
         melhor = None
         for fila in ("RANKED_SOLO_5x5", "RANKED_FLEX_SR"):
@@ -7123,10 +7194,10 @@ def conta_do_cartao(membro_id: int, conta: str | None = None) -> dict[str, Any] 
 
 
 async def gerar_arquivo_cartao(guild: discord.Guild, membro: discord.Member, conta: dict[str, Any],
-                               nome: str = "perfil") -> discord.File:
+                               nome: str = "perfil", estatico: bool = False) -> discord.File:
     """PNG normal ou GIF animado (premium com efeito ou fundo em GIF)."""
     dados = await dados_do_cartao(guild, membro, conta)
-    animado = eh_premium(membro) and bool(dados.get("efeito") or dados.get("fundo_gif"))
+    animado = not estatico and eh_premium(membro) and bool(dados.get("efeito") or dados.get("fundo_gif"))
     if animado:
         gif = await _desenhar(desenhar_cartao_animado, dados, dados.get("efeito"))
         return discord.File(io.BytesIO(gif), filename=f"{nome}.gif")
@@ -7239,12 +7310,12 @@ async def achar_campeao(texto: str) -> dict[str, Any] | None:
     return comecam[0] if len(comecam) == 1 else None
 
 
-async def previa_do_estilo(guild: discord.Guild, membro: discord.Member) -> discord.File | None:
+async def previa_do_estilo(guild: discord.Guild, membro: discord.Member, estatico: bool = False) -> discord.File | None:
     conta = conta_do_cartao(membro.id)
     if conta is None or Image is None:
         return None
     try:
-        return await gerar_arquivo_cartao(guild, membro, conta, nome="previa")
+        return await gerar_arquivo_cartao(guild, membro, conta, nome="previa", estatico=estatico)
     except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, KeyError, ErroRiot, OSError) as exc:
         log.warning("Perfil: prévia falhou: %s", exc)
         return None
@@ -7347,15 +7418,29 @@ class PainelEstiloView(discord.ui.View):
             await inter.response.defer()
         vez = _vez_do_painel[self.dono] = _vez_do_painel.get(self.dono, 0) + 1
         nova = PainelEstiloView(self.dono, campeao if campeao is not None else self.campeao)
-        arquivo = await previa_do_estilo(inter.guild, inter.user)
+        estilo = estilos_perfil.get(str(self.dono), {})
+        tem_gif = estilo.get("fundo") == "imagem" and (PASTA_FUNDOS / f"{self.dono}.gif").exists()
+        animado = eh_premium(inter.user) and bool(estilo.get("efeito") or tem_gif)
+        # 1º passo: prévia parada (rápida), para a cor/tema mudar na hora.
+        arquivo = await previa_do_estilo(inter.guild, inter.user, estatico=True)
         if _vez_do_painel.get(self.dono) != vez:
             return  # A pessoa já escolheu outra coisa; a prévia mais nova cuida da tela.
-        estilo = estilos_perfil.get(str(self.dono), {})
+        espera = "✨ Gerando a animação..." if animado else ""
         await inter.edit_original_response(
-            content=_texto_painel(estilo, aviso, inter.user), view=nova,
+            content=_texto_painel(estilo, "\n".join(t for t in (aviso, espera) if t), inter.user), view=nova,
             attachments=[arquivo] if arquivo else [],
         )
         self.stop()
+        if not animado:
+            return
+        # 2º passo: a versão animada substitui a parada quando fica pronta.
+        gif = await previa_do_estilo(inter.guild, inter.user)
+        if gif is None or _vez_do_painel.get(self.dono) != vez:
+            return
+        try:
+            await inter.edit_original_response(content=_texto_painel(estilo, aviso, inter.user), attachments=[gif])
+        except discord.HTTPException as exc:
+            log.warning("Perfil: não consegui trocar pela prévia animada: %s", exc)
 
     async def escolher_tema(self, inter: discord.Interaction) -> None:
         self._salvar(tema=inter.data["values"][0])
@@ -7381,7 +7466,7 @@ class PainelEstiloView(discord.ui.View):
                 "ou para quem a staff liberar.", ephemeral=True)
             return
         self._salvar(efeito=None if valor == "nenhum" else valor)
-        await self.atualizar(inter, "✨ Gerando o cartão animado..." if valor != "nenhum" else "")
+        await self.atualizar(inter)
 
     async def escolher_conta(self, inter: discord.Interaction) -> None:
         self._salvar(conta=inter.data["values"][0])
