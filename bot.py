@@ -6803,11 +6803,11 @@ def _faixa_arco_iris(largura: int, altura: int, alfa_max: int, cores: list[str] 
 
 
 def quadros_do_efeito(efeito: str, tema: dict[str, str], L: int, A: int, n: int,
-                      semente: int) -> list[tuple["Image.Image | None", "Image.Image | None"]]:
+                      semente: int) -> Any:
     """Para cada quadro: (camada atrás do texto, camada na frente). Loop perfeito em n quadros."""
     sorte = random.Random(semente)
     acento, segunda = tema["acento"], tema["segunda"]
-    saida: list[tuple[Any, Any]] = []
+    gerados = 0
     vazio = lambda: Image.new("RGBA", (L, A), (0, 0, 0, 0))  # noqa: E731
 
     if efeito == "estrelas":
@@ -6822,7 +6822,7 @@ def quadros_do_efeito(efeito: str, tema: dict[str, str], L: int, A: int, n: int,
                     r = int(tam * (0.25 + 0.25 * a))
                     g.ellipse((x - r * 2, y - r * 2, x + r * 2, y + r * 2), fill=_rgba(cor, 40 * a))
                     g.text((x, y), "✦", font=_fonte(int(tam * (0.6 + 0.5 * a)), True), fill=_rgba(cor, 255 * a), anchor="mm")
-            saida.append((None, frente))
+            gerados += 1; yield ((None, frente))
     elif efeito == "holografico":
         faixa = _faixa_arco_iris(320, A * 2, 120).rotate(18, expand=True)
         for i in range(n):
@@ -6833,7 +6833,7 @@ def quadros_do_efeito(efeito: str, tema: dict[str, str], L: int, A: int, n: int,
             import colorsys
             c = tuple(int(v * 255) for v in colorsys.hsv_to_rgb(t, 0.4, 1.0))
             ImageDraw.Draw(frente).rounded_rectangle((6, 6, L - 7, A - 7), radius=26, outline=(*c, 200), width=4)
-            saida.append((None, frente))
+            gerados += 1; yield ((None, frente))
     elif efeito == "coracoes":
         cor = [(sorte.uniform(L * 0.30, L - 30), sorte.random(), sorte.choice([1, 1, 2]), sorte.choice(["♥", "♡", "♥"]),
                 sorte.choice([16, 20, 26, 34]), sorte.choice([acento, segunda])) for _ in range(26)]
@@ -6846,7 +6846,7 @@ def quadros_do_efeito(efeito: str, tema: dict[str, str], L: int, A: int, n: int,
                 x = x0 + 14 * math.sin(2 * math.pi * (p * 2 + fase))
                 alfa = 235 * min(1.0, p * 5) * min(1.0, (1 - p) * 3)
                 g.text((x, y), simb, font=_fonte(tam, True), fill=_rgba(c, alfa), anchor="mm")
-            saida.append((None, frente))
+            gerados += 1; yield ((None, frente))
     elif efeito == "sakura":
         petalas = [(sorte.uniform(-150, L), sorte.random(), sorte.choice([1, 1, 2]), sorte.randint(9, 16),
                     sorte.choice([acento, segunda, "#FFFFFF"]), sorte.random()) for _ in range(34)]
@@ -6858,7 +6858,7 @@ def quadros_do_efeito(efeito: str, tema: dict[str, str], L: int, A: int, n: int,
                 y = int(p * (A + 60) - 30)
                 x = int(x0 + 140 * p + 18 * math.sin(2 * math.pi * (p * 2 + giro)))
                 _compor(frente, modelos[(tam, c)].rotate(360 * (p * 2 + giro)), x, y)
-            saida.append((None, frente))
+            gerados += 1; yield ((None, frente))
     elif efeito == "neon":
         for i in range(n):
             t = i / n
@@ -6872,7 +6872,7 @@ def quadros_do_efeito(efeito: str, tema: dict[str, str], L: int, A: int, n: int,
             brilho = brilho.filter(ImageFilter.GaussianBlur(9))
             g2 = ImageDraw.Draw(brilho)
             g2.rounded_rectangle((6, 6, L - 7, A - 7), radius=26, outline=_rgba("#FFFFFF", 230 * pulso), width=2)
-            saida.append((None, brilho))
+            gerados += 1; yield ((None, brilho))
     elif efeito == "aurora":
         for i in range(n):
             t, tras = i / n, vazio()
@@ -6884,7 +6884,7 @@ def quadros_do_efeito(efeito: str, tema: dict[str, str], L: int, A: int, n: int,
                     pontos.append((x, y))
                 g.line(pontos, fill=_rgba(cor, 150), width=46, joint="curve")
             tras = tras.filter(ImageFilter.GaussianBlur(22))
-            saida.append((tras, None))
+            gerados += 1; yield ((tras, None))
     elif efeito == "neve":
         flocos = [(sorte.uniform(0, L), sorte.random(), sorte.choice([1, 1, 2]), sorte.choice([2, 2, 3, 4, 0]),
                    sorte.random()) for _ in range(70)]
@@ -6899,7 +6899,7 @@ def quadros_do_efeito(efeito: str, tema: dict[str, str], L: int, A: int, n: int,
                     g.text((x, y), "❄", font=_fonte(16, True), fill=_rgba("#FFFFFF", 210), anchor="mm")
                 else:
                     g.ellipse((x - r, y - r, x + r, y + r), fill=_rgba("#FFFFFF", 220))
-            saida.append((None, frente))
+            gerados += 1; yield ((None, frente))
     elif efeito == "brasas":
         brasas = [(sorte.uniform(L * 0.05, L - 20), sorte.random(), sorte.choice([1, 1, 2]), sorte.uniform(1.5, 4),
                    sorte.choice([acento, "#FFB347", segunda])) for _ in range(46)]
@@ -6918,7 +6918,7 @@ def quadros_do_efeito(efeito: str, tema: dict[str, str], L: int, A: int, n: int,
                 alfa = 255 * (1 - p) * (0.6 + 0.4 * math.sin(2 * math.pi * (t * 4 + fase)))
                 g.ellipse((x - r * 3, y - r * 3, x + r * 3, y + r * 3), fill=_rgba(c, alfa * 0.25))
                 g.ellipse((x - r, y - r, x + r, y + r), fill=_rgba(c, alfa))
-            saida.append((tras, frente))
+            gerados += 1; yield ((tras, frente))
     elif efeito == "diamante":
         brilho_branco = _faixa_arco_iris(90, A * 2, 150, cores=["#FFFFFF"]).rotate(22, expand=True)
         perimetro = 2 * (L + A)
@@ -6943,7 +6943,7 @@ def quadros_do_efeito(efeito: str, tema: dict[str, str], L: int, A: int, n: int,
                 a = max(0.0, math.sin(2 * math.pi * (t * 2 + k / 4))) ** 6
                 if a > 0.05:
                     g.text((bx, by), "✦", font=_fonte(int(18 + 22 * a), True), fill=_rgba(segunda, 255 * a), anchor="mm")
-            saida.append((None, frente))
+            gerados += 1; yield ((None, frente))
     elif efeito == "noite":
         estrelas = [(sorte.randint(10, L - 10), sorte.randint(10, A - 10), sorte.random(), sorte.choice([1, 1, 2]))
                     for _ in range(110)]
@@ -6960,10 +6960,10 @@ def quadros_do_efeito(efeito: str, tema: dict[str, str], L: int, A: int, n: int,
                     tx, ty = hx + k * 9, hy - k * 3.4
                     g.ellipse((tx - 3, ty - 3, tx + 3, ty + 3), fill=_rgba(segunda, 240 * (1 - k / 16) * (1 - p * 0.3)))
                 g.text((hx, hy), "✦", font=_fonte(24, True), fill=_rgba("#FFFFFF", 255), anchor="mm")
-            saida.append((None, frente))
+            gerados += 1; yield ((None, frente))
     else:
-        saida = [(None, None)] * n
-    return saida
+        for _ in range(n):
+            yield (None, None)
 
 
 def desenhar_cartao_animado(d: dict[str, Any], efeito: str | None, rapido: bool = False) -> bytes:
@@ -6979,7 +6979,7 @@ def desenhar_cartao_animado(d: dict[str, Any], efeito: str | None, rapido: bool 
     semente = sum(map(ord, d.get("nome", "")))
     enfeites = camada_enfeites(tema, so_cores, semente, L, A)
     conteudo = camada_conteudo(d, tema, L, A)
-    efeitos = quadros_do_efeito(efeito or "", tema, L, A, n, semente)
+    efeitos = iter(quadros_do_efeito(efeito or "", tema, L, A, n, semente))  # um quadro de cada vez (pouca memória)
 
     base_fixa = None
     if k == 1:
@@ -6987,7 +6987,7 @@ def desenhar_cartao_animado(d: dict[str, Any], efeito: str | None, rapido: bool 
     quadros = []
     for i in range(n):
         q = (base_fixa if base_fixa is not None else fundos[i % k].convert("RGBA")).copy()
-        tras, frente = efeitos[i]
+        tras, frente = next(efeitos, (None, None))
         if efeito in PARTICULAS_ATRAS and frente is not None:
             tras, frente = frente, None  # partículas passam por trás dos textos
         if tras is not None:
@@ -6997,13 +6997,14 @@ def desenhar_cartao_animado(d: dict[str, Any], efeito: str | None, rapido: bool 
         if frente is not None:
             q.alpha_composite(frente)
         quadros.append(q.convert("RGB"))
+        del q, tras, frente
 
     # WebP animado: tamanho real, milhões de cores e bordas lisas (o GIF só tem 256 cores e
     # deixava o cartão "granulado"). O Discord mostra WebP animado em todas as plataformas.
     for qualidade in (88, 76, 66):
         saida = io.BytesIO()
         quadros[0].save(saida, "WEBP", save_all=True, append_images=quadros[1:], duration=duracao, loop=0,
-                        quality=qualidade, method=2)
+                        quality=qualidade, method=1)
         if saida.tell() <= 8_000_000:  # Cabe no limite de envio do Discord.
             return saida.getvalue()
     return saida.getvalue()
@@ -7245,7 +7246,7 @@ async def _cartao_pronto(dados: dict[str, Any], animado: bool, rapido: bool) -> 
         else:
             pronto = await _desenhar(desenhar_cartao, dados, rapido)
     _cartoes_prontos[chave] = pronto
-    while len(_cartoes_prontos) > 48:
+    while len(_cartoes_prontos) > 12:
         _cartoes_prontos.pop(next(iter(_cartoes_prontos)))
     return pronto
 
@@ -7510,6 +7511,7 @@ class PainelEstiloView(discord.ui.View):
 
 
     async def escolher_tema(self, inter: discord.Interaction) -> None:
+        await inter.response.defer()  # Responde ao Discord antes de qualquer coisa.
         self._salvar(tema=inter.data["values"][0])
         await self.atualizar(inter)
 
@@ -7532,14 +7534,17 @@ class PainelEstiloView(discord.ui.View):
                 "💎 Os efeitos animados são **premium**: para a staff, para quem dá **boost** no servidor "
                 "ou para quem a staff liberar.", ephemeral=True)
             return
+        await inter.response.defer()
         self._salvar(efeito=None if valor == "nenhum" else valor)
         await self.atualizar(inter)
 
     async def escolher_conta(self, inter: discord.Interaction) -> None:
+        await inter.response.defer()
         self._salvar(conta=inter.data["values"][0])
         await self.atualizar(inter)
 
     async def escolher_skin(self, inter: discord.Interaction) -> None:
+        await inter.response.defer()
         valor = inter.data["values"][0]
         nome = next((o.label for item in self.children if isinstance(item, discord.ui.Select)
                      for o in item.options if o.value == valor), valor)
@@ -7704,13 +7709,30 @@ def iniciar_recursos_extras() -> None:
     if not tarefas_extras.is_running():
         tarefas_extras.start()
     asyncio.ensure_future(_aquecer_cartao())
+    global _vigia_iniciado
+    if not _vigia_iniciado:
+        _vigia_iniciado = True
+        asyncio.ensure_future(_vigiar_atrasos())
+
+
+_vigia_iniciado = False
+
+
+async def _vigiar_atrasos() -> None:
+    """Diagnóstico: avisa no Console se o bot ficar travado (não conseguiria responder ao Discord)."""
+    while True:
+        inicio = time.monotonic()
+        await asyncio.sleep(0.5)
+        atraso = time.monotonic() - inicio - 0.5
+        if atraso > 1.5:
+            log.warning("Bot ficou travado por %.1fs (desenhistas: %s).", atraso,
+                        {k: v is not None for k, v in _desenhistas.items()})
 
 
 async def _aquecer_cartao() -> None:
     """Baixa os dados grandes do Data Dragon ao ligar: o 1º /perfil não fica esperando."""
     try:
-        versao = (await versoes_ddragon())[0]
-        await campeoes_completos(versao)
+        await versoes_ddragon()
         await nomes_campeoes()
     except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, KeyError) as exc:
         log.info("Cartão: não consegui pré-carregar o Data Dragon: %s", exc)
@@ -7722,7 +7744,29 @@ async def _aquecer_cartao() -> None:
 import concurrent.futures as _futuros
 import multiprocessing as _multiproc
 
-_desenhistas: dict[str, "_futuros.ProcessPoolExecutor | None"] = {"parado": None, "animado": None}
+_desenhistas: dict[str, "_futuros.ProcessPoolExecutor | None"] = {"animado": None}
+
+
+def _desenhar_e_liberar(funcao: Any, *args: Any) -> Any:
+    """Roda no processo ajudante e devolve a memória ao sistema no fim (o FadeHost tem pouca RAM)."""
+    try:
+        return funcao(*args)
+    finally:
+        import gc
+        gc.collect()
+        try:
+            import ctypes
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
+        except (OSError, AttributeError):
+            pass
+
+
+def _prioridade_baixa() -> None:
+    """O processo que desenha usa a CPU só quando o bot não precisa: o bot responde primeiro."""
+    try:
+        os.nice(19)
+    except (AttributeError, OSError):
+        pass
 
 
 def _preparar_desenhista() -> None:
@@ -7730,7 +7774,8 @@ def _preparar_desenhista() -> None:
     outro para os GIFs. Assim a troca de cor/tema não espera uma animação terminar."""
     for tipo in _desenhistas:
         try:
-            ajudante = _futuros.ProcessPoolExecutor(max_workers=1, mp_context=_multiproc.get_context("fork"))
+            ajudante = _futuros.ProcessPoolExecutor(max_workers=1, mp_context=_multiproc.get_context("fork"),
+                                                    initializer=_prioridade_baixa)
             ajudante.submit(int).result(timeout=30)
             _desenhistas[tipo] = ajudante
         except Exception as exc:  # Sem fork (ex.: Windows): desenha no próprio bot, como antes.
@@ -7740,12 +7785,12 @@ def _preparar_desenhista() -> None:
 
 async def _desenhar(funcao: Any, *args: Any, animado: bool = False) -> Any:
     tipo = "animado" if animado else "parado"
-    ajudante = _desenhistas.get(tipo)
+    ajudante = _desenhistas.get(tipo)  # A imagem parada é leve: desenha no próprio bot.
     if ajudante is not None:
         inicio = time.monotonic()
         try:
             resultado = await asyncio.wait_for(
-                asyncio.get_running_loop().run_in_executor(ajudante, funcao, *args), timeout=90)
+                asyncio.get_running_loop().run_in_executor(ajudante, _desenhar_e_liberar, funcao, *args), timeout=90)
             if time.monotonic() - inicio > 8:
                 log.info("Cartão: desenho %s levou %.1fs.", tipo, time.monotonic() - inicio)
             return resultado
