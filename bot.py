@@ -6865,8 +6865,10 @@ def desenhar_cartao(d: dict[str, Any], rapido: bool = False) -> bytes:
     imagem.alpha_composite(camada_enfeites(tema, so_cores, sum(map(ord, d.get("nome", ""))), L, A))
     imagem.alpha_composite(camada_conteudo(d, tema, L, A))
     saida = io.BytesIO()
-    # PNG = sem nenhuma perda de qualidade. Na prévia, compressão rápida (sai em centésimos de segundo).
-    imagem.convert("RGB").save(saida, "PNG", compress_level=1 if rapido else 6)
+    if rapido:  # Prévia do painel: PNG sem perda de qualidade, com compressão rápida.
+        imagem.convert("RGB").save(saida, "PNG", compress_level=1)
+    else:
+        imagem.convert("RGB").save(saida, "PNG", optimize=True)
     return saida.getvalue()
 
 
@@ -7191,7 +7193,7 @@ async def dados_do_cartao(guild: discord.Guild, membro: discord.Member, conta: d
     fundo_imagem = None
     if fundo_tipo == "imagem":
         try:
-            fundo_imagem = (PASTA_FUNDOS / f"{membro.id}.jpg").read_bytes()
+            fundo_imagem = _arquivo_fundo(membro.id).read_bytes()
         except OSError:
             fundo_imagem = None
     downloads = {
@@ -7367,7 +7369,7 @@ async def _cartao_pronto(dados: dict[str, Any], animado: bool, rapido: bool, mem
                 pronto = await _desenhar(desenhar_cartao_animado, dados, dados.get("efeito"), False, caprichado,
                                          animado=True)
             else:
-                pronto = await asyncio.to_thread(desenhar_cartao, dados, rapido)  # leve: não espera a fila das animações
+                pronto = await _desenhar(desenhar_cartao, dados, rapido)
         finally:
             if not caprichado:
                 _esperando_cartao -= 1
@@ -7481,9 +7483,6 @@ async def guardar_cartao(guild: discord.Guild, chave: str, conteudo: bytes, exte
     return msg.attachments[0].url
 
 
-_guardando: set["asyncio.Future[Any]"] = set()
-
-
 async def imagem_do_painel(guild: discord.Guild, membro: discord.Member,
                            estatico: bool = False) -> tuple[str | None, discord.File | None]:
     """(link, None) se o cartão já está guardado no Discord; senão desenha, guarda e devolve o link.
@@ -7500,10 +7499,9 @@ async def imagem_do_painel(guild: discord.Guild, membro: discord.Member,
             return link, None
         pronto = await _cartao_pronto(dados, animado, True, membro.id)
         extensao = "webp" if animado else "png"
-        # 1ª vez: mostra já (como anexo) e guarda no canal por trás, para as próximas serem instantâneas.
-        tarefa = asyncio.ensure_future(guardar_cartao(guild, chave, pronto, extensao))
-        _guardando.add(tarefa)
-        tarefa.add_done_callback(_guardando.discard)
+        link = await guardar_cartao(guild, chave, pronto, extensao)
+        if link:
+            return link, None
         return None, discord.File(io.BytesIO(pronto), filename=f"previa.{extensao}")
     except asyncio.CancelledError:
         raise
@@ -7650,11 +7648,18 @@ async def autocompletar_skin(inter: discord.Interaction, atual: str) -> list[app
     return saida[:25]
 
 
+def _arquivo_fundo(uid: int) -> Path:
+    """Fundo enviado pela pessoa: PNG (novo) ou JPG (enviado antes desta versão)."""
+    png = PASTA_FUNDOS / f"{uid}.png"
+    return png if png.exists() else PASTA_FUNDOS / f"{uid}.jpg"
+
+
 def _salvar_fundo(uid: int, dados: bytes) -> bool:
     """Salva o fundo. Devolve True se for um GIF animado."""
     PASTA_FUNDOS.mkdir(parents=True, exist_ok=True)
     imagem = _encaixar(dados, 1100, 500)
-    imagem.save(PASTA_FUNDOS / f"{uid}.jpg", "JPEG", quality=88)
+    imagem.save(PASTA_FUNDOS / f"{uid}.png", "PNG")  # PNG: sem perda de qualidade
+    (PASTA_FUNDOS / f"{uid}.jpg").unlink(missing_ok=True)  # fundo antigo (JPEG), se existir
     animado = getattr(Image.open(io.BytesIO(dados)), "n_frames", 1) > 1
     gif = PASTA_FUNDOS / f"{uid}.gif"
     if animado:
@@ -7833,29 +7838,20 @@ class PainelEstiloView(discord.ui.View):
             return _vez_do_painel.get(self.dono) != vez  # A pessoa já escolheu outra coisa.
 
         tarefa = asyncio.ensure_future(imagem_do_painel(inter.guild, inter.user))
-        feitas, _ = await asyncio.wait({tarefa}, timeout=0.35)
+        feitas, _ = await asyncio.wait({tarefa}, timeout=0.6)
         if antiga():
             tarefa.cancel()
             return
-        tem_gif = estilo.get("fundo") == "imagem" and (PASTA_FUNDOS / f"{self.dono}.gif").exists()
-        animado = eh_premium(inter.user) and bool(estilo.get("efeito") or tem_gif)
-        if not feitas and animado:
-            # Ainda não existe pronto: o novo visual (cor, tema, skin, fundo) aparece JÁ, parado e em
-            # qualidade total; a versão animada entra no lugar assim que fica pronta.
-            link_p, arquivo_p = await imagem_do_painel(inter.guild, inter.user, estatico=True)
-            if antiga():
-                tarefa.cancel()
-                return
-            if tarefa.done():  # A animação ficou pronta enquanto isso: pula direto para ela.
-                pass
-            else:
-                extra_p: dict[str, Any] = ({"attachments": [arquivo_p] if arquivo_p else []}
-                                           if (link_p or arquivo_p) else {})
-                await inter.edit_original_response(
-                    content=None, view=nova, **extra_p,
-                    embed=embed_do_painel(estilo, "\n".join(t for t in (aviso, "✨ Animando...") if t), inter.user,
-                                          link_p, arquivo_p))
-                self.stop()
+        if not feitas:
+            # O cartão que já está na tela continua rodando enquanto o novo é preparado.
+            atual = inter.message.embeds[0] if inter.message and inter.message.embeds else None
+            espera = discord.Embed(description=_texto_painel(estilo, "\n".join(t for t in (aviso, "✨ Aplicando...") if t),
+                                                             inter.user),
+                                   color=atual.color if atual else None)
+            if atual and atual.image and atual.image.url:
+                espera.set_image(url=atual.image.url)
+            await inter.edit_original_response(content=None, embed=espera, view=nova)
+            self.stop()
         link, arquivo = await tarefa
         if antiga():
             return
@@ -7876,7 +7872,7 @@ class PainelEstiloView(discord.ui.View):
     async def escolher_fundo(self, inter: discord.Interaction) -> None:
         valor = inter.data["values"][0]
         estilo = estilos_perfil.get(str(self.dono), {})
-        if valor == "imagem" and not (PASTA_FUNDOS / f"{self.dono}.jpg").exists():
+        if valor == "imagem" and not _arquivo_fundo(self.dono).exists():
             await inter.response.send_modal(ModalImagemFundo(self))
             return
         if valor == "skin" and not estilo.get("skin") and not self.campeao:
@@ -8068,38 +8064,16 @@ async def perfil_estilo(inter: discord.Interaction) -> None:
         return
     await inter.response.defer(ephemeral=True, thinking=True)
     estilo = estilos_perfil.get(str(inter.user.id), {})
-    tem_gif = estilo.get("fundo") == "imagem" and (PASTA_FUNDOS / f"{inter.user.id}.gif").exists()
-    animado = eh_premium(inter.user) and bool(estilo.get("efeito") or tem_gif)
-    tarefa = asyncio.ensure_future(imagem_do_painel(inter.guild, inter.user))
-    feitas, _ = await asyncio.wait({tarefa}, timeout=0.35 if animado else 60)
-    if feitas:  # Já estava pronto (ou é parado): abre direto.
-        link, arquivo, falta_animar = *tarefa.result(), False
-    else:  # Abre já com o cartão parado (sem perda de qualidade); a animação entra quando ficar pronta.
-        link, arquivo = await imagem_do_painel(inter.guild, inter.user, estatico=True)
-        falta_animar = not tarefa.done()
-        if not falta_animar:
-            link, arquivo = tarefa.result()
-    falta_animar = falta_animar and animado
-    kwargs: dict[str, Any] = {"embed": embed_do_painel(estilo, "✨ Animando..." if falta_animar else "", inter.user,
-                                                       link, arquivo),
+    try:
+        link, arquivo = await asyncio.wait_for(imagem_do_painel(inter.guild, inter.user), timeout=40)
+    except asyncio.TimeoutError:
+        log.warning("Perfil: prévia demorou demais; abrindo o painel sem imagem.")
+        link, arquivo = None, None
+    kwargs: dict[str, Any] = {"embed": embed_do_painel(estilo, "", inter.user, link, arquivo),
                               "view": PainelEstiloView(inter.user.id), "ephemeral": True}
     if arquivo:
         kwargs["file"] = arquivo
     await inter.followup.send(**kwargs)
-    vez = _vez_do_painel[inter.user.id] = _vez_do_painel.get(inter.user.id, 0) + 1
-    if falta_animar:
-        try:
-            link, arquivo = await asyncio.wait_for(tarefa, timeout=240)
-        except asyncio.TimeoutError:
-            link, arquivo = None, None
-        if (link or arquivo) and _vez_do_painel.get(inter.user.id) == vez:
-            try:
-                await inter.edit_original_response(embed=embed_do_painel(estilo, "", inter.user, link, arquivo),
-                                                   attachments=[arquivo] if arquivo else [])
-            except discord.HTTPException as exc:
-                log.warning("Perfil: não consegui trocar pela prévia animada: %s", exc)
-    elif not tarefa.done():
-        tarefa.cancel()
     preparar_efeitos(inter.guild, inter.user)
 
 
@@ -8110,7 +8084,7 @@ async def perfil_fundo_remover(inter: discord.Interaction, membro: discord.Membe
     if not (autorizado(inter) or await pode_gerenciar_contas(inter)):
         await inter.response.send_message("🔒 Só a staff pode remover fundos.", ephemeral=True)
         return
-    for ext in ("jpg", "gif"):
+    for ext in ("png", "jpg", "gif"):
         try:
             (PASTA_FUNDOS / f"{membro.id}.{ext}").unlink(missing_ok=True)
         except OSError:
