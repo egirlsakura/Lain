@@ -8231,6 +8231,21 @@ async def _desenhar(funcao: Any, *args: Any, animado: bool = False) -> Any:
 _preparar_desenhista()
 
 
+
+# ===== Riot ID copiado com caracteres invisíveis =====
+# Ao copiar um Riot ID do Discord ou do cliente do LoL, às vezes vêm junto caracteres invisíveis
+# de direção de texto (ex.: U+2066/U+2069). A Riot não acha a conta com eles, então são removidos aqui,
+# antes de qualquer busca (/link, botão Entrar, /aovivo...). A função original continua igual.
+_INVISIVEIS_RIOT_ID = {ord(c): None for c in "\u200b\u200c\u200d\u200e\u200f\u202a\u202b\u202c\u202d"
+                                              "\u202e\u2060\u2061\u2062\u2063\u2064\u2066\u2067\u2068"
+                                              "\u2069\ufeff\u00ad"}
+_INVISIVEIS_RIOT_ID[0x00A0] = " "  # espaço "duro" vira espaço normal
+_separar_riot_id_original = separar_riot_id
+
+
+def separar_riot_id(texto: str) -> tuple[str, str] | None:  # type: ignore[no-redef]
+    return _separar_riot_id_original((texto or "").translate(_INVISIVEIS_RIOT_ID))
+
 if __name__ == "__main__":
     if not TOKEN:
         raise SystemExit("Defina DISCORD_TOKEN no arquivo .env antes de executar o bot.")
